@@ -7,7 +7,8 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3000,
-    allowedHosts: true,
+    // Limit Host-header acceptance while retaining the Arena preview domain.
+    allowedHosts: ['.e2b.app'],
     proxy: {
       '/api': {
         target: 'http://localhost:3001',

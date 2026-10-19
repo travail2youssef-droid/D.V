@@ -4,6 +4,9 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createThrottle } from './rate-limit.js';
+import { isOutboundUrlAllowed, requestJson, resolveOutboundUrl } from './outbound.js';
+import { callAnthropic, callOpenAICompatible, extractAnthropicReply } from './ai-providers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -290,37 +293,17 @@ const route = handler => (req, res, next) => {
   }
 };
 
-// In-memory throttling, keyed per client IP. Bounded: the old Maps grew forever, and
-// every entry was a free memory leak for anyone willing to rotate source IPs.
-function createThrottle({ windowMs, max }) {
-  const hits = new Map();
-  const MAX_TRACKED = 4096;
-  const sweep = now => {
-    if (hits.size <= MAX_TRACKED) return;
-    for (const [key, entry] of hits) if (entry.until <= now) hits.delete(key);
-  };
-  const bump = req => {
-    const now = Date.now();
-    sweep(now);
-    const key = req.ip || 'unknown';
-    const entry = hits.get(key) || { count: 0, until: now + windowMs };
-    entry.count += 1;
-    hits.set(key, entry);
-  };
-  return {
-    isLimited: req => {
-      const entry = hits.get(req.ip || 'unknown');
-      return !!entry && entry.count >= max && entry.until > Date.now();
-    },
-    bump,
-    reset: req => hits.delete(req.ip || 'unknown'),
-    size: () => hits.size,
-  };
-}
-
+// In-process fixed-window limits. The dedicated limiter module resets expired
+// windows and bounds the key map; use a shared store for multi-instance deployments.
 const contactThrottle = createThrottle({ windowMs: 10 * 60 * 1000, max: 5 });
 const authThrottle = createThrottle({ windowMs: 15 * 60 * 1000, max: 10 });
 const orderThrottle = createThrottle({ windowMs: 10 * 60 * 1000, max: 10 });
+const chatIpThrottle = createThrottle({ windowMs: 10 * 60 * 1000, max: 30 });
+const chatOrderThrottle = createThrottle({
+  windowMs: 10 * 60 * 1000,
+  max: 8,
+  keyOf: req => req.params?.id || req.ip || 'unknown',
+});
 
 // Validation helpers — every public write goes through them, so a bad type can no
 // longer reach `.trim()` and turn into a 500 with a stack trace.
@@ -648,55 +631,8 @@ app.use('/api/orders/:id', route((req, res, next) => {
   next();
 }));
 
-// 4b. Conversation helpers
-// One HTTP helper for every outbound provider call: the three duplicated fetch blocks
-// each had their own half-handling of errors, and none of them checked the URL host.
-async function requestJson(url, { headers = {}, body, timeoutMs = 30000 }) {
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (err) {
-    return { ok: false, status: 0, data: null, text: '', error: err.message };
-  }
-  const text = await response.text().catch(() => '');
-  if (!response.ok) return { ok: false, status: response.status, data: null, text: text.slice(0, 200) };
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = null;
-  }
-  return { ok: true, status: response.status, data, text };
-}
-
-// The webhook/endpoint base URL is stored as free text by the admin UI and then
-// fetched from the server, so it used to be a plain SSRF into the internal network.
-// Literal private hosts are refused unless ALLOW_PRIVATE_WEBHOOKS=1 (self-hosted n8n
-// on a LAN). Note this only covers literal names: a public hostname resolving to a
-// private IP still needs the network layer to be locked down.
-const PRIVATE_HOST = /^(localhost$|.*\.localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.0\.0\.0$|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|\[?::1\]?$|\[?f[cd][0-9a-f]{2}:|\[?fe80:)/i;
-function resolveOutboundUrl(rawUrl, suffix = '') {
-  const base = typeof rawUrl === 'string' ? rawUrl.trim() : '';
-  if (!base) return null;
-  let url;
-  try {
-    url = new URL(base.endsWith('/') || suffix === '' ? `${base}${suffix}` : `${base}/${suffix}`);
-  } catch {
-    return null;
-  }
-  if (!['http:', 'https:'].includes(url.protocol)) return null;
-  if (process.env.ALLOW_PRIVATE_WEBHOOKS !== '1' && PRIVATE_HOST.test(url.hostname)) {
-    console.warn(`Refused outbound call to a private host: ${url.hostname}`);
-    return null;
-  }
-  return url.href;
-}
-
+// 4b. Conversation helpers. Outbound transport and URL validation live in outbound.js
+// so DNS pinning, private-address checks, response limits, and redirect policy are shared.
 function buildN8nTarget(settings) {
   const base = typeof settings.n8nWebhookUrl === 'string' ? settings.n8nWebhookUrl.trim() : '';
   if (!base) return null;
@@ -716,28 +652,6 @@ const extractN8nReply = data => {
   return '';
 };
 
-async function callChatCompletion({ endpoint, apiKey, model, systemPrompt, history }) {
-  const url = resolveOutboundUrl(endpoint.replace(/\/+$/, ''), 'chat/completions');
-  if (!url) return '';
-  const out = await requestJson(url, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: {
-      model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...history.map(m => ({ role: m.sender === 'agent' ? 'assistant' : 'user', content: m.message })),
-      ],
-      temperature: 0.7,
-      max_tokens: 350,
-    },
-  });
-  if (!out.ok) {
-    console.warn(`LLM call failed (${out.status || out.error}), fallback to native engine.`);
-    return '';
-  }
-  return out.data?.choices?.[0]?.message?.content || '';
-}
-
 app.post('/api/orders/:id/chat', route(async (req, res) => {
   const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
   if (!message || message.length > 10000) {
@@ -747,8 +661,20 @@ app.post('/api/orders/:id/chat', route(async (req, res) => {
   const snapshot = findOrder(req.params.id);
   if (!snapshot.order) return res.status(404).json({ success: false, error: 'Commande introuvable' });
   const order = snapshot.order;
-  const historyBefore = Array.isArray(order.chatHistory) ? order.chatHistory : [];
+  if (order.isBriefComplete) {
+    return res.status(409).json({ success: false, error: 'Le cadrage est déjà finalisé ; aucun nouveau message ne sera ajouté.' });
+  }
 
+  const limitedThrottle = [chatOrderThrottle, chatIpThrottle].find(throttle => throttle.isLimited(req));
+  if (limitedThrottle) {
+    const seconds = Math.max(1, Math.ceil(limitedThrottle.retryAfterMs(req) / 1000));
+    res.setHeader('Retry-After', String(seconds));
+    return res.status(429).json({ success: false, error: 'Trop de messages. Réessayez après quelques minutes.' });
+  }
+  chatOrderThrottle.bump(req);
+  chatIpThrottle.bump(req);
+
+  const historyBefore = Array.isArray(order.chatHistory) ? order.chatHistory : [];
   const userMsg = {
     id: `msg-${Date.now()}-${randomUUID().slice(0, 8)}-u`,
     sender: 'user',
@@ -759,26 +685,6 @@ app.post('/api/orders/:id/chat', route(async (req, res) => {
   // on-disk object is no longer mutated in place while the provider call is pending.
   const history = [...historyBefore, userMsg];
   const userResponsesCount = history.filter(m => m.sender === 'user').length;
-
-  // Brief already complete: no provider call, just acknowledge through the queue.
-  if (order.isBriefComplete) {
-    const endMsg = {
-      id: `msg-${Date.now()}-${randomUUID().slice(0, 8)}-a`,
-      sender: 'agent',
-      message: 'Votre cadrage est déjà complet et transmis à nos équipes de développement. Vous pouvez suivre l\'avancement depuis votre tableau de bord ou contacter notre équipe directement.',
-      timestamp: new Date().toISOString(),
-    };
-    const updated = await withOrders(orders => {
-      const target = orders.find(o => o.id === req.params.id);
-      if (!target) return false;
-      if (!Array.isArray(target.chatHistory)) target.chatHistory = [];
-      target.chatHistory.push(userMsg, endMsg);
-      return target;
-    });
-    if (!updated) return res.status(404).json({ success: false, error: 'Commande introuvable' });
-    sendSseEvent('order_updated', redactOrder(updated));
-    return res.json({ success: true, order: updated, agentReply: endMsg });
-  }
 
   const settings = readJson(SETTINGS_FILE, defaultSettings);
   let agentReplyText = '';
@@ -812,30 +718,38 @@ app.post('/api/orders/:id/chat', route(async (req, res) => {
     }
   }
 
-  // --- 2. Groq, then 3. any OpenAI-compatible endpoint ---
   const contextBlock = `\n\nContexte :\nClient : ${order.client?.firstName ?? ''} ${order.client?.lastName ?? ''}\nForfait choisi : ${order.planName}\nÉchéance : ${order.deadline}\nQuestions posées : ${userResponsesCount}/4.\nSi ${userResponsesCount} >= 4, conclus chaleureusement et annonce la génération de l'audit de compatibilité.`;
+  const systemPrompt = `${asText(settings.systemPrompt, 8000) || defaultSettings.systemPrompt}${contextBlock}`;
   const groqKey = typeof settings.groqApiKey === 'string' ? settings.groqApiKey.trim() : '';
-  if (!agentReplyText && (settings.provider === 'groq' || groqKey) && groqKey.length > 5) {
-    agentReplyText = await callChatCompletion({
+  const apiKey = typeof settings.apiKey === 'string' ? settings.apiKey.trim() : '';
+  const provider = PROVIDERS.includes(settings.provider) ? settings.provider : 'n8n';
+
+  if (!agentReplyText && provider === 'groq' && groqKey.length > 5) {
+    agentReplyText = await callOpenAICompatible({
       endpoint: 'https://api.groq.com/openai/v1',
       apiKey: groqKey,
       model: asText(settings.groqModel, 120) || 'llama-3.3-70b-versatile',
-      systemPrompt: `${settings.systemPrompt}${contextBlock}`,
+      systemPrompt,
       history,
     });
-  }
-  const openaiKey = typeof settings.apiKey === 'string' ? settings.apiKey.trim() : '';
-  if (!agentReplyText && openaiKey.length > 5) {
-    agentReplyText = await callChatCompletion({
+  } else if (!agentReplyText && provider === 'anthropic' && apiKey.length > 5) {
+    agentReplyText = await callAnthropic({
+      apiKey,
+      model: asText(settings.model, 120) || 'claude-3-5-sonnet-latest',
+      systemPrompt,
+      history,
+    });
+  } else if (!agentReplyText && ['openai', 'custom'].includes(provider) && apiKey.length > 5) {
+    agentReplyText = await callOpenAICompatible({
       endpoint: asText(settings.customEndpoint, 500) || 'https://api.openai.com/v1',
-      apiKey: openaiKey,
+      apiKey,
       model: asText(settings.model, 120) || 'gpt-4o-mini',
-      systemPrompt: `${settings.systemPrompt}${contextBlock}`,
+      systemPrompt,
       history,
     });
   }
 
-  // --- 4. Built-in conversational engine, so the brief never stalls without a key ---
+  // Built-in conversational engine: the brief never stalls without a usable provider.
   if (!agentReplyText) agentReplyText = generateSmartAgentReply(order, userResponsesCount, message);
 
   const agentMsg = {
@@ -847,14 +761,16 @@ app.post('/api/orders/:id/chat', route(async (req, res) => {
   const shouldFinalize = userResponsesCount >= 4;
 
   // The write happens after the slow provider call, inside the queue, on a freshly
-  // read copy: two clients briefing at the same time used to overwrite each other.
+  // read copy. Recompute the threshold from that copy so simultaneous messages cannot
+  // leave the brief permanently open just because each request saw an older snapshot.
   const updated = await withOrders(orders => {
     const target = orders.find(o => o.id === req.params.id);
     if (!target) return false;
     if (!Array.isArray(target.chatHistory)) target.chatHistory = [];
     target.chatHistory.push(userMsg, agentMsg);
     target.questionsAskedCount = (target.questionsAskedCount || 1) + 1;
-    if (shouldFinalize && !target.isBriefComplete) {
+    const actualUserResponsesCount = target.chatHistory.filter(item => item.sender === 'user').length;
+    if ((shouldFinalize || actualUserResponsesCount >= 4) && !target.isBriefComplete) {
       target.isBriefComplete = true;
       target.status = 'Brief finalisé — En analyse';
       target.compatibilityReport = generateCompatibilityAudit(target);
@@ -971,14 +887,23 @@ function generateCompatibilityAudit(order) {
 
 // 5. POST /api/orders/:id/finalize - Manual or forced finalization
 app.post('/api/orders/:id/finalize', route(async (req, res) => {
+  let alreadyFinalized = false;
   const updated = await withOrders(orders => {
     const order = orders.find(o => o.id === req.params.id);
     if (!order) return false;
+    if (order.isBriefComplete && order.compatibilityReport) {
+      alreadyFinalized = true;
+      return false;
+    }
     order.isBriefComplete = true;
     order.status = 'Brief finalisé — En analyse';
     order.compatibilityReport = generateCompatibilityAudit(order);
     return order;
   });
+  if (!updated && alreadyFinalized) {
+    const { order } = findOrder(req.params.id);
+    return res.json({ success: true, order });
+  }
   if (!updated) return res.status(404).json({ success: false, error: 'Commande introuvable' });
 
   sendSseEvent('order_updated', redactOrder(updated));
@@ -1167,7 +1092,7 @@ const SETTINGS_LIMITS = {
   customEndpoint: 500,
   systemPrompt: 8000,
 };
-app.post('/api/settings', route((req, res) => {
+app.post('/api/settings', route(async (req, res) => {
   const body = isPlainObject(req.body) ? req.body : {};
   const unknown = Object.keys(body).filter(key => !(key in SETTINGS_LIMITS));
   const wrongType = Object.keys(body).filter(key => key in SETTINGS_LIMITS && body[key] !== null && typeof body[key] !== 'string');
@@ -1177,12 +1102,15 @@ app.post('/api/settings', route((req, res) => {
   if (body.provider !== undefined && !PROVIDERS.includes(body.provider)) {
     return badRequest(res, `Fournisseur inconnu. Valeurs acceptées : ${PROVIDERS.join(', ')}.`);
   }
-  if (body.n8nWebhookUrl) {
+  if (body.n8nWebhookUrl && (body.provider === undefined || body.provider === 'n8n')) {
     const probe = /^https?:\/\//i.test(body.n8nWebhookUrl.trim()) ? body.n8nWebhookUrl.trim() : `https://${body.n8nWebhookUrl.trim()}`;
-    if (!resolveOutboundUrl(probe)) return badRequest(res, 'URL n8n invalide (http/https, hôte public).');
+    if (!resolveOutboundUrl(probe) || !await isOutboundUrlAllowed(probe)) {
+      return badRequest(res, 'URL n8n invalide : la destination doit être un hôte public (ou un hôte privé explicitement autorisé).');
+    }
   }
-  if (body.customEndpoint && !resolveOutboundUrl(body.customEndpoint.trim())) {
-    return badRequest(res, 'Endpoint invalide (http/https, hôte public).');
+  if (body.customEndpoint && (body.provider === undefined || ['openai', 'custom'].includes(body.provider))
+    && (!resolveOutboundUrl(body.customEndpoint.trim()) || !await isOutboundUrlAllowed(body.customEndpoint.trim()))) {
+    return badRequest(res, 'Endpoint invalide : la destination doit être un hôte public (ou explicitement autorisé).');
   }
 
   const settings = { ...readJson(SETTINGS_FILE, defaultSettings) };
@@ -1248,32 +1176,55 @@ app.post('/api/settings/test-n8n', route(async (req, res) => {
   res.json({ success: true, message: `Webhook n8n joint avec succès en ${elapsed}ms ! Réponse de l'Agent : "${reply}"` });
 }));
 
-// 11. POST /api/settings/test - Test API Key connectivity (OpenAI / Groq)
+// 11. POST /api/settings/test - Test OpenAI-compatible, Groq or Anthropic credentials
 app.post('/api/settings/test', route(async (req, res) => {
   const body = isPlainObject(req.body) ? req.body : {};
   const settings = readJson(SETTINGS_FILE, defaultSettings);
-  const isGroq = body.provider === 'groq';
-  const targetKey = (asText(body.apiKey, 400) || (isGroq ? asText(settings.groqApiKey, 400) : asText(settings.apiKey, 400)) || '').trim();
+  const provider = asText(body.provider, 20) || settings.provider;
+  const isGroq = provider === 'groq';
+  const isAnthropic = provider === 'anthropic';
+  if (!['groq', 'openai', 'custom', 'anthropic'].includes(provider)) {
+    return badRequest(res, 'Fournisseur de test invalide. Choisissez Groq, OpenAI-compatible ou Anthropic.');
+  }
 
+  const targetKey = (asText(body.apiKey, 400)
+    || (isGroq ? asText(settings.groqApiKey, 400) : asText(settings.apiKey, 400))
+    || '').trim();
   if (!targetKey) {
     return badRequest(res, "Aucune clé API fournie. Le moteur de fallback heuristique DigitalVerse reste actif.");
   }
 
-  const endpoint = isGroq
-    ? 'https://api.groq.com/openai/v1'
-    : (asText(body.customEndpoint, 500) || asText(settings.customEndpoint, 500) || 'https://api.openai.com/v1');
-  const testUrl = resolveOutboundUrl(endpoint.replace(/\/+$/, ''), 'chat/completions');
+  const endpoint = isAnthropic
+    ? 'https://api.anthropic.com/v1/messages'
+    : isGroq
+      ? 'https://api.groq.com/openai/v1/chat/completions'
+      : `${(asText(body.customEndpoint, 500) || asText(settings.customEndpoint, 500) || 'https://api.openai.com/v1').replace(/\/+$/, '')}/chat/completions`;
+  const testUrl = resolveOutboundUrl(endpoint);
   if (!testUrl) return badRequest(res, 'Endpoint invalide : hôte http/https public attendu.');
-  const chosenModel = asText(body.model, 120) || (isGroq ? asText(settings.groqModel, 120) : asText(settings.model, 120)) || (isGroq ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini');
 
+  const fallbackModel = isGroq
+    ? 'llama-3.3-70b-versatile'
+    : isAnthropic ? 'claude-3-5-sonnet-latest' : 'gpt-4o-mini';
+  const chosenModel = asText(body.model, 120)
+    || (isGroq ? asText(settings.groqModel, 120) : asText(settings.model, 120))
+    || fallbackModel;
   const startTime = Date.now();
   const out = await requestJson(testUrl, {
-    headers: { Authorization: `Bearer ${targetKey}` },
-    body: {
-      model: chosenModel,
-      messages: [{ role: 'user', content: 'Ping test. Réponds en un mot : "Connecté"' }],
-      max_tokens: 10,
-    },
+    headers: isAnthropic
+      ? { 'x-api-key': targetKey, 'anthropic-version': '2023-06-01' }
+      : { Authorization: `Bearer ${targetKey}` },
+    body: isAnthropic
+      ? {
+        model: chosenModel,
+        system: 'Réponds en un mot.',
+        messages: [{ role: 'user', content: 'Ping test. Réponds : Connecté' }],
+        max_tokens: 10,
+      }
+      : {
+        model: chosenModel,
+        messages: [{ role: 'user', content: 'Ping test. Réponds en un mot : "Connecté"' }],
+        max_tokens: 10,
+      },
   });
   const elapsed = Date.now() - startTime;
 
@@ -1281,8 +1232,11 @@ app.post('/api/settings/test', route(async (req, res) => {
     if (out.status === 0) return res.status(400).json({ success: false, error: `Impossible de contacter le serveur distant : ${out.error}` });
     return res.status(400).json({ success: false, error: `Erreur fournisseur (${out.status}) : ${out.text.slice(0, 150)}` });
   }
-  const reply = out.data?.choices?.[0]?.message?.content?.trim() || 'OK';
-  res.json({ success: true, message: `API ${isGroq ? 'Groq' : 'LLM'} opérationnelle en ${elapsed}ms ! Réponse du modèle : "${reply}"` });
+  const reply = (isAnthropic
+    ? extractAnthropicReply(out.data)
+    : out.data?.choices?.[0]?.message?.content?.trim()) || 'OK';
+  const providerLabel = isGroq ? 'Groq' : isAnthropic ? 'Anthropic' : 'LLM';
+  res.json({ success: true, message: `API ${providerLabel} opérationnelle en ${elapsed}ms ! Réponse du modèle : "${reply}"` });
 }));
 
 // Unknown API route -> JSON 404, never the SPA shell.
