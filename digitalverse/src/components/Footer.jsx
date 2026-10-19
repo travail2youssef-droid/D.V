@@ -1,7 +1,6 @@
-import React, { useState } from 'react';
-import Logo from './Logo';
 import { Link } from 'react-router-dom';
-import { ShieldCheck, ExternalLink, Lock } from 'lucide-react';
+import { Lock } from 'lucide-react';
+import Logo from './Logo';
 
 export default function Footer({ onOpenAdmin, onOpenLegal, onOpenPrivacy }) {
   return (

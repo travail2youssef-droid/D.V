@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { PROJECTS } from '../data/content';
-import { ArrowRight, ExternalLink, Sparkles, X, CheckCircle, Shield } from 'lucide-react';
+import { ArrowRight, X, CheckCircle } from 'lucide-react';
 
 export default function Portfolio({ onOpenOrder }) {
   const [selectedProject, setSelectedProject] = useState(null);
@@ -35,7 +35,13 @@ export default function Portfolio({ onOpenOrder }) {
           {PROJECTS.map((project) => (
             <div
               key={project.id}
+              role="button"
+              tabIndex={0}
+              aria-label={`Ouvrir la fiche du projet ${project.title}`}
               onClick={() => setSelectedProject(project)}
+              onKeyDown={event => {
+                if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setSelectedProject(project); }
+              }}
               className="group cursor-pointer bg-[#0e0e0e] rounded-2xl overflow-hidden border border-white/[0.08] hover:border-[#F20D25]/40 transition-all duration-300 hover:-translate-y-1.5 flex flex-col shadow-xl shadow-black/60"
             >
               {/* Image Preview Box */}

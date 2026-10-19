@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Mail, Send, CheckCircle, AlertCircle, Bot, ArrowRight } from 'lucide-react';
+import { useState } from 'react';
+import { Send, CheckCircle, AlertCircle, Bot, ArrowRight } from 'lucide-react';
 
 export default function Contact({ onStartAiChat }) {
   const [formData, setFormData] = useState({

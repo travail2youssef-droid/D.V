@@ -1,5 +1,4 @@
-import React from 'react';
-import { ArrowRight, Sparkles, TrendingUp, Cpu, CheckCircle } from 'lucide-react';
+import { ArrowRight, TrendingUp, Cpu } from 'lucide-react';
 
 export default function Hero({ onOpenOrder, onOpenServices, onOpenPortfolio }) {
   return (

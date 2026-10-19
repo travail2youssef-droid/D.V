@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { LayoutDashboard, Layers, Inbox, ExternalLink, Settings2, ArrowUpRight, ArrowLeft, LogOut, Search, RefreshCw, ChevronRight, X, Mail, Phone, Clock, Check, ShieldCheck, AlertCircle, LockKeyhole } from 'lucide-react';
 import Logo from './Logo';
 import AdminDashboard from './AdminDashboard';
@@ -19,8 +19,10 @@ const demoContacts = [{ id: 'DEMO-C1', name: 'Morgan Dupont', email: 'morgan@exa
 function safeUrl(value) { try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) ? url.href : null; } catch { return null; } }
 async function api(url, options = {}) {
   const response = await fetch(url, options);
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error || 'Impossible de charger les données.');
+  // A proxy error or an HTML error page would otherwise throw "Unexpected token <"
+  // and show that instead of the real reason.
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `Le serveur a répondu ${response.status}.`);
   return result;
 }
 
@@ -39,8 +41,9 @@ export default function AdminWorkspace() {
   const [advanced, setAdvanced] = useState(false);
   const [updated, setUpdated] = useState(null);
   const demo = auth === 'demo';
+  const drawerOpen = selected !== null;
   useEffect(() => {
-    if (!selected) return;
+    if (!drawerOpen) return undefined;
     const previous = document.activeElement;
     const overflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
@@ -56,7 +59,7 @@ export default function AdminWorkspace() {
     };
     document.addEventListener('keydown', trap);
     return () => { document.body.style.overflow = overflow; document.removeEventListener('keydown', trap); previous?.focus(); };
-  }, [selected?.id]);
+  }, [drawerOpen]);
   useEffect(() => {
     document.title = 'Administration — DigitalVerse';
     api('/api/auth/session').then(data => setAuth(data.authenticated ? 'authenticated' : 'login')).catch(() => setAuth('login'));

@@ -1,6 +1,5 @@
-import React from 'react';
 import { PROCESS_STEPS } from '../data/content';
-import { ArrowRight, CheckCircle2 } from 'lucide-react';
+import { CheckCircle2 } from 'lucide-react';
 
 export default function Process() {
   return (

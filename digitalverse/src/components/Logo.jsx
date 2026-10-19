@@ -1,4 +1,3 @@
-import React from 'react';
 
 export default function Logo({ size = 'default', showText = true, className = '' }) {
   const width = showText ? (size === 'large' ? 250 : size === 'small' ? 160 : 195) : (size === 'large' ? 48 : 36);

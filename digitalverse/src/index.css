@@ -137,3 +137,11 @@ em { font-style:normal; color:var(--accent); }
 @media(max-width:1100px) { .desktop-nav { gap:16px; }.nav-contact { display:none; }.new-hero { padding-top:150px; }.hero-copy h1 { letter-spacing:-2.5px; }.spatial-scene { transform:scale(.85); }.hero-actions { gap:18px; } }
 @media(max-width:760px) { .site-nav { padding:18px 6%; }.desktop-nav { display:none; }.mobile-toggle { display:block; }.new-hero { padding:130px 6% 40px;grid-template-columns:1fr;min-height:0; }.hero-copy h1 { font-size:56px; }.hero-copy > p { font-size:13px; }.spatial-scene { height:410px;transform:scale(.9);margin-top:10px; }.hero-footnote { margin-bottom:0; }.expertise-strip { gap:17px; }.expertise-strip span { flex-basis:100%;text-align:center;margin:0; }.expertise-strip b { font-size:11px; }.home-paths,.home-feature { padding:65px 6%; }.home-section-title { display:block; }.home-section-title > a { margin-top:20px; }.path-grid { grid-template-columns:1fr; }.path-icon { padding:10px 0;font-size:45px; }.home-feature { grid-template-columns:1fr;gap:35px; }.feature-image { transform:none; }.closing-cta { padding:65px 6%; }.page-intro { padding:135px 6% 10px; }.intro-rule { gap:20px;line-height:1.8; }.intro-orbit { opacity:.4; }.scene-caption { font-size:7px;right:0; } }
 @media(prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none !important;transition:none !important;scroll-behavior:auto !important; }.scene-world { transform:none; }.spatial-core { transform:rotateX(-18deg) rotateY(-30deg) rotateZ(-8deg); }.path-card:hover { transform:none; } }
+
+/* Logo: sized inline by Logo.jsx; this only keeps it out of the text flow and
+   prevents accidental selection/drag when it is used as a link label. */
+.brand-logo {
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+}

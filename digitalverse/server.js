@@ -11,8 +11,20 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// Set TRUST_PROXY_HOPS to the number of reverse proxies in front of Node (nginx,
+// Caddy, PaaS...). Left at 0 on purpose: trusting X-Forwarded-For without a real
+// proxy in front would let any client spoof its IP and bypass the rate limits.
+const TRUST_PROXY_HOPS = Number.parseInt(process.env.TRUST_PROXY_HOPS ?? '0', 10);
+app.set('trust proxy', Number.isFinite(TRUST_PROXY_HOPS) ? TRUST_PROXY_HOPS : 0);
+
+// The site calls this API same-origin, so no CORS headers are emitted by default.
+// Set CORS_ORIGIN="https://a.example,https://b.example" to open specific origins.
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || '').split(',').map(v => v.trim()).filter(Boolean);
+if (CORS_ORIGINS.length) app.use(cors({ origin: CORS_ORIGINS, credentials: true }));
+
+// A 64kb cap is far above any legitimate payload here (chat messages are capped at
+// 10 000 characters) and keeps a hostile body from being parsed for nothing.
+app.use(express.json({ limit: '64kb' }));
 
 // Ensure data directory exists
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -215,39 +227,169 @@ const initialRegistry = [
   }
 ];
 
-// Helper functions for reading/writing JSON files
-function readJson(filePath, defaultValue) {
-  try {
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2), 'utf-8');
-      return defaultValue;
-    }
-    const data = fs.readFileSync(filePath, 'utf-8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error(`Error reading ${filePath}:`, err);
-    return defaultValue;
+// Helper functions for reading/writing JSON files.
+// A read never rewrites the file, and unreadable data is never silently replaced by
+// the defaults: the previous behaviour turned one truncated write into permanent data
+// loss, because the catch returned the seed value and the next write persisted it.
+class StorageError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'StorageError';
+    this.statusCode = 503;
   }
 }
 
-function writeJson(filePath, data) {
+function readJson(filePath, defaultValue) {
+  if (!fs.existsSync(filePath)) {
+    if (defaultValue === undefined) {
+      throw new StorageError(`Fichier de données absent : ${path.basename(filePath)}`);
+    }
+    return structuredClone(defaultValue);
+  }
+  let raw;
   try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    raw = fs.readFileSync(filePath, 'utf-8');
+  } catch (err) {
+    throw new StorageError(`Lecture impossible (${path.basename(filePath)}).`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error(`Corrupt JSON in ${filePath}:`, err.message);
+    throw new StorageError(`Données illisibles dans ${path.basename(filePath)} : laissez-les en place et réparez le fichier.`);
+  }
+}
+
+// Atomic: write beside the target then rename, so a crash mid-write cannot truncate
+// the live file. mode 0o600 because these files hold client PII and API keys.
+function writeJson(filePath, data) {
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tmpPath, filePath);
     return true;
   } catch (err) {
     console.error(`Error writing ${filePath}:`, err);
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      /* the temp file may not exist; nothing to clean */
+    }
     return false;
   }
 }
 
-// Initialize files if not existing
+// Run a route handler (sync or async) so that a throw always reaches the error
+// middleware instead of escaping as an unhandled rejection.
+const route = handler => (req, res, next) => {
+  try {
+    const out = handler(req, res, next);
+    if (out && typeof out.catch === 'function') out.catch(next);
+  } catch (err) {
+    next(err);
+  }
+};
+
+// In-memory throttling, keyed per client IP. Bounded: the old Maps grew forever, and
+// every entry was a free memory leak for anyone willing to rotate source IPs.
+function createThrottle({ windowMs, max }) {
+  const hits = new Map();
+  const MAX_TRACKED = 4096;
+  const sweep = now => {
+    if (hits.size <= MAX_TRACKED) return;
+    for (const [key, entry] of hits) if (entry.until <= now) hits.delete(key);
+  };
+  const bump = req => {
+    const now = Date.now();
+    sweep(now);
+    const key = req.ip || 'unknown';
+    const entry = hits.get(key) || { count: 0, until: now + windowMs };
+    entry.count += 1;
+    hits.set(key, entry);
+  };
+  return {
+    isLimited: req => {
+      const entry = hits.get(req.ip || 'unknown');
+      return !!entry && entry.count >= max && entry.until > Date.now();
+    },
+    bump,
+    reset: req => hits.delete(req.ip || 'unknown'),
+    size: () => hits.size,
+  };
+}
+
+const contactThrottle = createThrottle({ windowMs: 10 * 60 * 1000, max: 5 });
+const authThrottle = createThrottle({ windowMs: 15 * 60 * 1000, max: 10 });
+const orderThrottle = createThrottle({ windowMs: 10 * 60 * 1000, max: 10 });
+
+// Validation helpers — every public write goes through them, so a bad type can no
+// longer reach `.trim()` and turn into a 500 with a stack trace.
+const isPlainObject = value => typeof value === 'object' && value !== null && !Array.isArray(value);
+const asText = (value, max = 254) => (typeof value === 'string' ? value.trim().slice(0, max) : undefined);
+const isHttpUrl = value => {
+  if (typeof value !== 'string') return false;
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+};
+const badRequest = (res, error) => res.status(400).json({ success: false, error });
+
+// Clients do not need to see each other's private brief tokens, and the admin does
+// not need them at all.
+const redactOrder = order => {
+  if (!isPlainObject(order)) return order;
+  const rest = { ...order };
+  delete rest.clientToken;
+  return rest;
+};
+
+const tokenMatches = (provided, expected) => {
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+
+function findOrder(id) {
+  const stored = readJson(ORDERS_FILE, initialOrders);
+  const orders = Array.isArray(stored) ? stored : [];
+  return { orders, order: orders.find(item => item && item.id === id) || null };
+}
+
+// Orders are a single JSON array rewritten in full, so every mutation must be
+// serialised: without this queue, two clients briefing at the same time (or an admin
+// PATCH landing during a 30s provider call) silently dropped each other's messages.
+// The mutator receives a freshly read list; returning `false` skips the write.
+let ordersQueue = Promise.resolve();
+async function withOrders(mutator) {
+  const run = async () => {
+    const stored = readJson(ORDERS_FILE, initialOrders);
+    const orders = Array.isArray(stored) ? stored : [];
+    const result = await mutator(orders);
+    if (result === false) return false;
+    if (!writeJson(ORDERS_FILE, orders)) {
+      throw Object.assign(new Error('Enregistrement des commandes impossible.'), { statusCode: 500 });
+    }
+    return result;
+  };
+  const next = ordersQueue.then(run, run);
+  ordersQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+// Initialize files if not existing.
+// The two demo orders and the demo registry entries exist to make the interface
+// reviewable; seeding them into a production data directory would hand your clients'
+// admin a dashboard full of invented leads, so they only land in a non-production boot.
+const SEED_DEMO = process.env.NODE_ENV !== 'production' || process.env.DV_SEED_DEMO === '1';
 if (!fs.existsSync(SETTINGS_FILE)) writeJson(SETTINGS_FILE, defaultSettings);
-if (!fs.existsSync(ORDERS_FILE)) writeJson(ORDERS_FILE, initialOrders);
-if (!fs.existsSync(REGISTRY_FILE)) writeJson(REGISTRY_FILE, initialRegistry);
+if (!fs.existsSync(ORDERS_FILE)) writeJson(ORDERS_FILE, SEED_DEMO ? initialOrders : []);
+if (!fs.existsSync(REGISTRY_FILE)) writeJson(REGISTRY_FILE, SEED_DEMO ? initialRegistry : []);
 
 // Short-lived server-side sessions. Credentials never enter the client bundle.
 const adminSessions = new Map();
-const loginAttempts = new Map();
+const MAX_SESSIONS = 200;
 const sessionId = req => (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith('dv_admin='))?.slice(9);
 const hasSession = req => {
   const token = sessionId(req);
@@ -256,165 +398,215 @@ const hasSession = req => {
   if (token) adminSessions.delete(token);
   return false;
 };
-app.post('/api/auth/login', (req, res) => {
-  if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) return res.status(503).json({ error: 'Administration non configurée. Définissez ADMIN_USER et ADMIN_PASSWORD sur le serveur, puis redémarrez-le.' });
-  const now = Date.now();
-  for (const [ip, entry] of loginAttempts) if (entry.until < now) loginAttempts.delete(ip);
-  const attempt = loginAttempts.get(req.ip) || { count: 0, until: now + 900000 };
-  if (attempt.count >= 10) return res.status(429).json({ error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
-  attempt.count++;
-  loginAttempts.set(req.ip, attempt);
+const credentialsMatch = body => {
   const expected = Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASSWORD}`);
-  const provided = Buffer.from(`${req.body.username || ''}:${req.body.password || ''}`);
-  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) return res.status(401).json({ error: 'Identifiants incorrects.' });
-  loginAttempts.delete(req.ip);
+  const provided = Buffer.from(body);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+};
+const authFailure = res => res.status(429).json({ success: false, error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
+const adminDisabled = res => res.status(503).json({ success: false, error: 'Administration désactivée : configurez ADMIN_USER et ADMIN_PASSWORD.' });
+
+app.post('/api/auth/login', route((req, res) => {
+  if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) return res.status(503).json({ error: 'Administration non configurée. Définissez ADMIN_USER et ADMIN_PASSWORD sur le serveur, puis redémarrez-le.' });
+  if (authThrottle.isLimited(req)) return authFailure(res);
+  const body = isPlainObject(req.body) ? req.body : {};
+  const username = asText(body.username, 200) ?? '';
+  const password = typeof body.password === 'string' ? body.password.slice(0, 500) : '';
+  if (!credentialsMatch(`${username}:${password}`)) {
+    authThrottle.bump(req);
+    return res.status(401).json({ error: 'Identifiants incorrects.' });
+  }
+  authThrottle.reset(req);
+  const now = Date.now();
   for (const [key, expiry] of adminSessions) if (expiry < now) adminSessions.delete(key);
+  while (adminSessions.size >= MAX_SESSIONS) adminSessions.delete(adminSessions.keys().next().value);
   const token = randomUUID();
   adminSessions.set(token, now + 8 * 3600000);
   const secure = req.secure || req.get('x-forwarded-proto') === 'https';
   res.setHeader('Set-Cookie', `dv_admin=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure ? '; Secure' : ''}`);
   res.json({ success: true });
-});
-app.post('/api/auth/logout', (req, res) => {
+}));
+app.post('/api/auth/logout', route((req, res) => {
   adminSessions.delete(sessionId(req));
   res.setHeader('Set-Cookie', 'dv_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
   res.json({ success: true });
-});
-app.get('/api/auth/session', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json({ authenticated: hasSession(req) }); });
+}));
+app.get('/api/auth/session', route((req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json({ authenticated: hasSession(req) }); }));
 
 // Administration is locked unless credentials are explicitly configured.
 function adminGuard(req, res, next) {
   res.setHeader('Cache-Control', 'no-store');
   if (hasSession(req)) return next();
-  if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) {
-    return res.status(503).json({ success: false, error: 'Administration désactivée : configurez ADMIN_USER et ADMIN_PASSWORD.' });
-  }
-  const expected = Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASSWORD}`);
-  const provided = Buffer.from((req.headers.authorization || '').replace(/^Basic /, ''), 'base64');
-  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+  if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) return adminDisabled(res);
+  // Basic auth used to bypass the login throttle entirely, which made the admin
+  // password brute-forceable one request at a time with no lockout. Only requests
+  // carrying an actual credential count as failures, so anonymous probes cannot lock
+  // the real admin out of their own back office.
+  const header = req.headers.authorization || '';
+  if (!/^Basic /.test(header)) return res.status(401).json({ success: false, error: 'Authentification requise.' });
+  if (authThrottle.isLimited(req)) return authFailure(res);
+  if (!credentialsMatch(Buffer.from(header.slice(6), 'base64').toString('utf8'))) {
+    authThrottle.bump(req);
     return res.status(401).json({ success: false, error: 'Authentification requise.' });
   }
+  authThrottle.reset(req);
   next();
 }
-app.use((req, res, next) => {
+app.use(route((req, res, next) => {
   const administrative = req.path.startsWith('/api/settings') || req.path.startsWith('/api/registry') || req.path === '/api/events' || (req.path.startsWith('/api/orders') && ['GET', 'PATCH'].includes(req.method)) || req.path === '/api/contacts';
   if (administrative) return adminGuard(req, res, next);
   next();
-});
-app.get('/api/contacts', (req, res) => {
-  const file = path.join(DATA_DIR, 'contacts.json');
-  try {
-    res.json({ success: true, contacts: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [] });
-  } catch {
-    res.status(500).json({ success: false, error: 'Impossible de lire les demandes.' });
-  }
-});
+}));
+const CONTACTS_FILE = path.join(DATA_DIR, 'contacts.json');
+app.get('/api/contacts', route((req, res) => {
+  const stored = readJson(CONTACTS_FILE, []);
+  res.json({ success: true, contacts: Array.isArray(stored) ? stored : [] });
+}));
 
 // --- SSE Setup for real-time live events ---
 let sseClients = [];
+const SSE_MAX_CLIENTS = Number.parseInt(process.env.SSE_MAX_CLIENTS ?? '32', 10);
+const SSE_HEARTBEAT_MS = 25000;
+
+// A client that vanished mid-flight used to make `.write()` throw inside the order
+// handlers: the admin got a 500 for an update that had already been saved, and every
+// remaining subscriber lost the event.
 function sendSseEvent(eventType, data) {
-  sseClients.forEach(client => {
-    client.res.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
+  let payload;
+  try {
+    payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  } catch (err) {
+    console.error(`Cannot serialise SSE event ${eventType}:`, err.message);
+    return;
+  }
+  sseClients = sseClients.filter(client => {
+    try {
+      client.res.write(payload);
+      return true;
+    } catch {
+      return false;
+    }
   });
 }
 
-app.get('/api/events', (req, res) => {
+app.get('/api/events', route((req, res) => {
+  if (sseClients.length >= SSE_MAX_CLIENTS) {
+    return res.status(503).json({ success: false, error: 'Trop de flux temps réel ouverts. Fermez un onglet d’administration.' });
+  }
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const clientId = Date.now();
-  const newClient = { id: clientId, res };
-  sseClients.push(newClient);
+  const clientId = `${Date.now()}-${randomUUID()}`;
+  sseClients.push({ id: clientId, res });
+  // Without a periodic comment, proxies silently drop an idle stream and the "live"
+  // dashboard stops being live with no visible error.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, SSE_HEARTBEAT_MS);
 
   req.on('close', () => {
+    clearInterval(heartbeat);
     sseClients = sseClients.filter(c => c.id !== clientId);
   });
-});
+}));
 
 // --- API ROUTES ---
 
 // Persist contact requests before acknowledging receipt.
-const contactLimits = new Map();
-app.post('/api/contact', (req, res) => {
+app.post('/api/contact', route((req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
   const fields = ['name', 'email', 'message', 'company', 'projectType', 'budget'];
-  if (fields.some(key => req.body[key] !== undefined && typeof req.body[key] !== 'string')) {
-    return res.status(400).json({ success: false, error: 'Format de formulaire invalide.' });
+  if (fields.some(key => body[key] !== undefined && typeof body[key] !== 'string')) {
+    return badRequest(res, 'Format de formulaire invalide.');
   }
-  const { name = '', email = '', message = '', consent } = req.body;
+  const { name = '', email = '', message = '', consent } = body;
   if (!name.trim() || name.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !message.trim() || message.length > 10000 || consent !== true) {
-    return res.status(400).json({ success: false, error: 'Vérifiez votre nom, votre email, votre message et votre consentement.' });
+    return badRequest(res, 'Vérifiez votre nom, votre email, votre message et votre consentement.');
   }
-  const now = Date.now();
-  for (const [key, limit] of contactLimits) if (limit.until < now) contactLimits.delete(key);
-  const key = req.ip;
-  const limit = contactLimits.get(key) || { count: 0, until: now + 600000 };
-  if (limit.count >= 5) return res.status(429).json({ success: false, error: 'Trop de demandes. Réessayez dans quelques minutes.' });
-  limit.count += 1;
-  contactLimits.set(key, limit);
-  const file = path.join(DATA_DIR, 'contacts.json');
+  if (contactThrottle.isLimited(req)) {
+    return res.status(429).json({ success: false, error: 'Trop de demandes. Réessayez dans quelques minutes.' });
+  }
+  contactThrottle.bump(req);
   try {
-    const contacts = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
+    const stored = readJson(CONTACTS_FILE, []);
+    const contacts = Array.isArray(stored) ? stored : [];
     const request = { id: randomUUID(), createdAt: new Date().toISOString(), consent: true };
-    for (const field of fields) request[field] = (req.body[field] || '').trim().slice(0, field === 'message' ? 10000 : 254);
+    for (const field of fields) request[field] = asText(body[field], field === 'message' ? 10000 : 254) ?? '';
     contacts.unshift(request);
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(contacts, null, 2), { mode: 0o600 });
-    fs.renameSync(`${file}.tmp`, file);
+    if (!writeJson(CONTACTS_FILE, contacts)) throw new Error('write failed');
     return res.status(201).json({ success: true, id: request.id });
   } catch (err) {
     console.error('Contact persistence failed:', err.message);
     return res.status(500).json({ success: false, error: 'Votre demande n’a pas pu être enregistrée. Veuillez réessayer.' });
   }
-});
+}));
 
 // 1. GET /api/orders - List all orders
-app.get('/api/orders', (req, res) => {
+app.get('/api/orders', route((req, res) => {
   const orders = readJson(ORDERS_FILE, initialOrders);
   orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json({ success: true, count: orders.length, orders });
-});
+  res.json({ success: true, count: orders.length, orders: orders.map(redactOrder) });
+}));
 
 // 2. GET /api/orders/:id - Get single order
-app.get('/api/orders/:id', (req, res) => {
+app.get('/api/orders/:id', route((req, res) => {
   const orders = readJson(ORDERS_FILE, initialOrders);
   const order = orders.find(o => o.id === req.params.id);
   if (!order) {
     return res.status(404).json({ success: false, error: "Commande introuvable" });
   }
-  res.json({ success: true, order });
-});
+  res.json({ success: true, order: redactOrder(order) });
+}));
 
 // 3. POST /api/orders - Create new order
-app.post('/api/orders', (req, res) => {
-  const { client, projectType, planId, planName, deadline, initialNotes } = req.body;
-
-  if (!client || ['firstName', 'lastName', 'email'].some(key => typeof client[key] !== 'string' || !client[key].trim()) || (client.phone !== undefined && typeof client.phone !== 'string') || (initialNotes !== undefined && typeof initialNotes !== 'string')) {
-    return res.status(400).json({ success: false, error: "Coordonnées incomplètes (prénom, nom, email obligatoires)" });
+// Public write: it needs both a size cap and a rate limit, otherwise a script could
+// fill orders.json (which is rewritten in full on every chat message) at no cost.
+app.post('/api/orders', route((req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const { client } = body;
+  if (orderThrottle.isLimited(req)) {
+    return res.status(429).json({ success: false, error: 'Trop de demandes simultanées. Réessayez dans quelques minutes.' });
   }
 
-  const orders = readJson(ORDERS_FILE, initialOrders);
+  if (!isPlainObject(client)
+    || ['firstName', 'lastName', 'email'].some(key => typeof client[key] !== 'string' || !client[key].trim())
+    || (client.phone !== undefined && typeof client.phone !== 'string')
+    || (body.initialNotes !== undefined && typeof body.initialNotes !== 'string')
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(client.email.trim())
+    || ['planId', 'planName', 'deadline'].some(key => body[key] !== undefined && typeof body[key] !== 'string')) {
+    return badRequest(res, "Coordonnées incomplètes (prénom, nom et email valide obligatoires)");
+  }
+
+  const firstName = asText(client.firstName, 120);
+  const planName = asText(body.planName, 200) || "Vitrine Starter (300 €)";
+  const projectType = asText(body.projectType, 24) === 'agent_ai' ? 'agent_ai' : 'site';
   const newId = `DV-${randomUUID()}`;
 
   const openingMessage = projectType === 'agent_ai'
-    ? `Bonjour ${client.firstName} ! Bienvenue chez DigitalVerse. Je suis Nova, votre architecte en intelligence artificielle et automatisation. Vous avez sélectionné le forfait "${planName}". Pour initier notre cadrage technique, pouvez-vous me décrire brièvement le rôle principal que vous souhaitez confier à votre agent ou à vos automatisations ?`
-    : `Bonjour ${client.firstName} ! Bienvenue chez DigitalVerse. Je suis Nova, votre architecte digital dédié. Vous avez sélectionné le forfait "${planName}". Pour concevoir la solution idéale, pouvez-vous me décrire en quelques mots l'activité de votre entreprise et l'objectif numéro un de votre futur site web ?`;
+    ? `Bonjour ${firstName} ! Bienvenue chez DigitalVerse. Je suis Nova, votre architecte en intelligence artificielle et automatisation. Vous avez sélectionné le forfait "${planName}". Pour initier notre cadrage technique, pouvez-vous me décrire brièvement le rôle principal que vous souhaitez confier à votre agent ou à vos automatisations ?`
+    : `Bonjour ${firstName} ! Bienvenue chez DigitalVerse. Je suis Nova, votre architecte digital dédié. Vous avez sélectionné le forfait "${planName}". Pour concevoir la solution idéale, pouvez-vous me décrire en quelques mots l'activité de votre entreprise et l'objectif numéro un de votre futur site web ?`;
 
   const newOrder = {
     id: newId,
     clientToken: randomUUID(),
     createdAt: new Date().toISOString(),
     client: {
-      firstName: client.firstName.trim(),
-      lastName: client.lastName.trim(),
-      email: client.email.trim(),
-      phone: client.phone ? client.phone.trim() : "Non renseigné"
+      firstName,
+      lastName: asText(client.lastName, 120),
+      email: asText(client.email, 254),
+      phone: asText(client.phone, 60) || "Non renseigné"
     },
-    projectType: projectType || "site",
-    planId: planId || "vitrine-starter",
-    planName: planName || "Vitrine Starter (300 €)",
-    deadline: deadline || "Standard (2 à 3 semaines)",
-    initialNotes: initialNotes ? initialNotes.trim() : "",
+    projectType,
+    planId: asText(body.planId, 80) || "vitrine-starter",
+    planName,
+    deadline: asText(body.deadline, 120) || "Standard (2 à 3 semaines)",
+    initialNotes: asText(body.initialNotes, 4000) ?? "",
     status: "Nouveau — En cours de cadrage IA",
     chatHistory: [
       {
@@ -430,238 +622,263 @@ app.post('/api/orders', (req, res) => {
     deliverable: null
   };
 
+  const orders = readJson(ORDERS_FILE, initialOrders);
+  if (!Array.isArray(orders)) throw new StorageError('orders.json ne contient pas une liste.');
   orders.unshift(newOrder);
-  writeJson(ORDERS_FILE, orders);
+  if (!writeJson(ORDERS_FILE, orders)) {
+    return res.status(500).json({ success: false, error: "La commande n’a pas pu être enregistrée. Réessayez." });
+  }
+  orderThrottle.bump(req);
 
-  sendSseEvent('new_order', newOrder);
+  // Never broadcast the private brief token to every open admin tab.
+  sendSseEvent('new_order', redactOrder(newOrder));
 
   res.status(201).json({ success: true, order: newOrder });
-});
+}));
 
-// 4. POST /api/orders/:id/chat - Send message to AI Agent
-// Client briefing access is separate from administrative credentials.
-app.use('/api/orders/:id', (req, res, next) => {
+// 4. POST /api/orders/:id/chat — the client brief has its own access path, separate
+// from administrative credentials.
+app.use('/api/orders/:id', route((req, res, next) => {
   if (req.method !== 'POST' || !['/chat', '/finalize'].includes(req.path)) return next();
-  const order = readJson(ORDERS_FILE, []).find(item => item.id === req.params.id);
-  const token = req.get('X-Order-Token');
-  if (!order || !order.clientToken || token !== order.clientToken) {
+  const { order } = findOrder(req.params.id);
+  const token = req.get('X-Order-Token') || '';
+  if (!order || !order.clientToken || !token || !tokenMatches(token, order.clientToken)) {
     return res.status(403).json({ success: false, error: 'Accès au brief non autorisé. Contactez notre équipe pour reprendre une ancienne demande.' });
   }
   next();
-});
+}));
 
-app.post('/api/orders/:id/chat', async (req, res) => {
-  const { message } = req.body;
-  if (typeof message !== 'string' || !message.trim() || message.length > 10000) {
-    return res.status(400).json({ success: false, error: "Message vide" });
+// 4b. Conversation helpers
+// One HTTP helper for every outbound provider call: the three duplicated fetch blocks
+// each had their own half-handling of errors, and none of them checked the URL host.
+async function requestJson(url, { headers = {}, body, timeoutMs = 30000 }) {
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    return { ok: false, status: 0, data: null, text: '', error: err.message };
+  }
+  const text = await response.text().catch(() => '');
+  if (!response.ok) return { ok: false, status: response.status, data: null, text: text.slice(0, 200) };
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  return { ok: true, status: response.status, data, text };
+}
+
+// The webhook/endpoint base URL is stored as free text by the admin UI and then
+// fetched from the server, so it used to be a plain SSRF into the internal network.
+// Literal private hosts are refused unless ALLOW_PRIVATE_WEBHOOKS=1 (self-hosted n8n
+// on a LAN). Note this only covers literal names: a public hostname resolving to a
+// private IP still needs the network layer to be locked down.
+const PRIVATE_HOST = /^(localhost$|.*\.localhost$|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|0\.0\.0\.0$|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|\[?::1\]?$|\[?f[cd][0-9a-f]{2}:|\[?fe80:)/i;
+function resolveOutboundUrl(rawUrl, suffix = '') {
+  const base = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (!base) return null;
+  let url;
+  try {
+    url = new URL(base.endsWith('/') || suffix === '' ? `${base}${suffix}` : `${base}/${suffix}`);
+  } catch {
+    return null;
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) return null;
+  if (process.env.ALLOW_PRIVATE_WEBHOOKS !== '1' && PRIVATE_HOST.test(url.hostname)) {
+    console.warn(`Refused outbound call to a private host: ${url.hostname}`);
+    return null;
+  }
+  return url.href;
+}
+
+function buildN8nTarget(settings) {
+  const base = typeof settings.n8nWebhookUrl === 'string' ? settings.n8nWebhookUrl.trim() : '';
+  if (!base) return null;
+  if (base.includes('/webhook')) return resolveOutboundUrl(base);
+  const mode = settings.n8nMode === 'webhook-test' ? 'webhook-test' : 'webhook';
+  const hookId = typeof settings.n8nWebhookId === 'string' ? settings.n8nWebhookId.trim() : '';
+  return resolveOutboundUrl(base.replace(/\/+$/, ''), `${mode}/${encodeURIComponent(hookId)}/chat`);
+}
+
+const extractN8nReply = data => {
+  if (typeof data === 'string') return data;
+  if (!data || typeof data !== 'object') return '';
+  if (data.output) return String(data.output);
+  if (data.text) return String(data.text);
+  if (Array.isArray(data) && data[0]?.output) return String(data[0].output);
+  if (data.data) return typeof data.data === 'string' ? data.data : JSON.stringify(data.data);
+  return '';
+};
+
+async function callChatCompletion({ endpoint, apiKey, model, systemPrompt, history }) {
+  const url = resolveOutboundUrl(endpoint.replace(/\/+$/, ''), 'chat/completions');
+  if (!url) return '';
+  const out = await requestJson(url, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: {
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...history.map(m => ({ role: m.sender === 'agent' ? 'assistant' : 'user', content: m.message })),
+      ],
+      temperature: 0.7,
+      max_tokens: 350,
+    },
+  });
+  if (!out.ok) {
+    console.warn(`LLM call failed (${out.status || out.error}), fallback to native engine.`);
+    return '';
+  }
+  return out.data?.choices?.[0]?.message?.content || '';
+}
+
+app.post('/api/orders/:id/chat', route(async (req, res) => {
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!message || message.length > 10000) {
+    return badRequest(res, 'Message vide ou trop long (10 000 caractères maximum).');
   }
 
-  const orders = readJson(ORDERS_FILE, initialOrders);
-  const orderIndex = orders.findIndex(o => o.id === req.params.id);
-  if (orderIndex === -1) {
-    return res.status(404).json({ success: false, error: "Commande introuvable" });
-  }
+  const snapshot = findOrder(req.params.id);
+  if (!snapshot.order) return res.status(404).json({ success: false, error: 'Commande introuvable' });
+  const order = snapshot.order;
+  const historyBefore = Array.isArray(order.chatHistory) ? order.chatHistory : [];
 
-  const order = orders[orderIndex];
-
-  // Add user message to history
   const userMsg = {
-    id: `msg-${Date.now()}-u`,
-    sender: "user",
-    message: message.trim(),
-    timestamp: new Date().toISOString()
+    id: `msg-${Date.now()}-${randomUUID().slice(0, 8)}-u`,
+    sender: 'user',
+    message,
+    timestamp: new Date().toISOString(),
   };
-  order.chatHistory.push(userMsg);
+  // The new message is counted exactly like before (history + this one), but the
+  // on-disk object is no longer mutated in place while the provider call is pending.
+  const history = [...historyBefore, userMsg];
+  const userResponsesCount = history.filter(m => m.sender === 'user').length;
 
-  // If already complete
+  // Brief already complete: no provider call, just acknowledge through the queue.
   if (order.isBriefComplete) {
     const endMsg = {
-      id: `msg-${Date.now()}-a`,
-      sender: "agent",
-      message: "Votre cadrage est déjà complet et transmis à nos équipes de développement. Vous pouvez suivre l'avancement depuis votre tableau de bord ou contacter notre équipe directement.",
-      timestamp: new Date().toISOString()
+      id: `msg-${Date.now()}-${randomUUID().slice(0, 8)}-a`,
+      sender: 'agent',
+      message: 'Votre cadrage est déjà complet et transmis à nos équipes de développement. Vous pouvez suivre l\'avancement depuis votre tableau de bord ou contacter notre équipe directement.',
+      timestamp: new Date().toISOString(),
     };
-    order.chatHistory.push(endMsg);
-    orders[orderIndex] = order;
-    writeJson(ORDERS_FILE, orders);
-    return res.json({ success: true, order, agentReply: endMsg });
+    const updated = await withOrders(orders => {
+      const target = orders.find(o => o.id === req.params.id);
+      if (!target) return false;
+      if (!Array.isArray(target.chatHistory)) target.chatHistory = [];
+      target.chatHistory.push(userMsg, endMsg);
+      return target;
+    });
+    if (!updated) return res.status(404).json({ success: false, error: 'Commande introuvable' });
+    sendSseEvent('order_updated', redactOrder(updated));
+    return res.json({ success: true, order: updated, agentReply: endMsg });
   }
 
-  const userResponsesCount = order.chatHistory.filter(m => m.sender === 'user').length;
   const settings = readJson(SETTINGS_FILE, defaultSettings);
+  let agentReplyText = '';
 
-  let agentReplyText = "";
-  let shouldFinalize = userResponsesCount >= 4;
-
-  // --- 1. n8n WEBHOOK INTEGRATION (if n8n is selected or n8n URL is provided) ---
-  if (settings.provider === 'n8n' && settings.n8nWebhookUrl && settings.n8nWebhookUrl.trim().length > 5) {
-    try {
-      let targetUrl = settings.n8nWebhookUrl.trim();
-      // If user provided base domain e.g. https://my-n8n.app, construct webhook URL
-      if (!targetUrl.includes('/webhook')) {
-        const mode = settings.n8nMode || 'webhook';
-        const hookId = settings.n8nWebhookId || 'b639adfd-6c4b-48cd-af68-fb21384fcc52';
-        targetUrl = `${targetUrl.replace(/\/+$/, '')}/${mode}/${hookId}/chat`;
-      }
-
-      console.log(`Calling n8n Chat Webhook at: ${targetUrl}`);
-      const n8nResp = await fetch(targetUrl, {
-        method: 'POST',
-      signal: AbortSignal.timeout(30000),
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'sendMessage',
-          chatInput: message.trim(),
-          sessionId: order.id,
-          orderInfo: {
-            id: order.id,
-            clientName: `${order.client.firstName} ${order.client.lastName}`,
-            email: order.client.email,
-            phone: order.client.phone,
-            planName: order.planName,
-            projectType: order.projectType,
-            deadline: order.deadline,
-            questionsCount: userResponsesCount
-          }
-        })
-      });
-
-      if (n8nResp.ok) {
-        const n8nData = await n8nResp.json();
-        // Support multiple n8n response shapes
-        if (typeof n8nData === 'string') {
-          agentReplyText = n8nData;
-        } else if (n8nData.output) {
-          agentReplyText = n8nData.output;
-        } else if (n8nData.text) {
-          agentReplyText = n8nData.text;
-        } else if (Array.isArray(n8nData) && n8nData[0]?.output) {
-          agentReplyText = n8nData[0].output;
-        } else if (n8nData.data) {
-          agentReplyText = typeof n8nData.data === 'string' ? n8nData.data : JSON.stringify(n8nData.data);
-        }
-      } else {
-        console.warn(`n8n Webhook returned status ${n8nResp.status}, fallback to native engine.`);
-      }
-    } catch (n8nErr) {
-      console.warn("n8n Webhook call failed:", n8nErr.message);
-    }
-  }
-
-  // --- 2. GROQ DIRECT API INTEGRATION (if groq is selected) ---
-  if (!agentReplyText && (settings.provider === 'groq' || settings.groqApiKey)) {
-    const groqKey = settings.groqApiKey?.trim();
-    if (groqKey && groqKey.length > 5) {
-      try {
-        const groqResp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-      signal: AbortSignal.timeout(30000),
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${groqKey}`
-          },
-          body: JSON.stringify({
-            model: settings.groqModel || 'llama-3.3-70b-versatile',
-            messages: [
-              {
-                role: 'system',
-                content: `${settings.systemPrompt}\n\nContexte :\nClient : ${order.client.firstName} ${order.client.lastName}\nForfait choisi : ${order.planName}\nÉchéance : ${order.deadline}\nQuestions posées : ${userResponsesCount}/4.\nSi ${userResponsesCount} >= 4, conclus chaleureusement.`
-              },
-              ...order.chatHistory.map(m => ({
-                role: m.sender === 'agent' ? 'assistant' : 'user',
-                content: m.message
-              }))
-            ],
-            temperature: 0.7,
-            max_tokens: 350
-          })
-        });
-
-        if (groqResp.ok) {
-          const gData = await groqResp.json();
-          agentReplyText = gData.choices?.[0]?.message?.content || "";
-        }
-      } catch (gErr) {
-        console.warn("Groq direct call failed:", gErr.message);
-      }
-    }
-  }
-
-  // --- 3. OPENAI / CUSTOM ENDPOINT INTEGRATION ---
-  if (!agentReplyText && settings.apiKey && settings.apiKey.trim().length > 5) {
-    try {
-      const response = await fetch(`${settings.customEndpoint || 'https://api.openai.com/v1'}/chat/completions`, {
-        method: 'POST',
-      signal: AbortSignal.timeout(30000),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${settings.apiKey.trim()}`
+  // --- 1. n8n webhook, if configured ---
+  const n8nTarget = settings.provider === 'n8n' ? buildN8nTarget(settings) : null;
+  if (n8nTarget) {
+    const out = await requestJson(n8nTarget, {
+      body: {
+        action: 'sendMessage',
+        chatInput: message,
+        sessionId: order.id,
+        orderInfo: {
+          id: order.id,
+          clientName: `${order.client?.firstName ?? ''} ${order.client?.lastName ?? ''}`.trim(),
+          email: order.client?.email ?? '',
+          phone: order.client?.phone ?? '',
+          planName: order.planName,
+          projectType: order.projectType,
+          deadline: order.deadline,
+          questionsCount: userResponsesCount,
         },
-        body: JSON.stringify({
-          model: settings.model || 'gpt-4o-mini',
-          messages: [
-            {
-              role: 'system',
-              content: `${settings.systemPrompt}\n\nContexte actuel :\nClient : ${order.client.firstName} ${order.client.lastName}\nForfait choisi : ${order.planName}\nÉchéance : ${order.deadline}\nNombre d'échanges utilisateur : ${userResponsesCount}/4.\nSi ${userResponsesCount} >= 4, conclus le brief chaleureusement et dis que tu vas générer l'audit de compatibilité.`
-            },
-            ...order.chatHistory.map(m => ({
-              role: m.sender === 'agent' ? 'assistant' : 'user',
-              content: m.message
-            }))
-          ],
-          temperature: 0.7,
-          max_tokens: 350
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        agentReplyText = data.choices?.[0]?.message?.content || "";
-      }
-    } catch (apiErr) {
-      console.warn("External OpenAI call failed:", apiErr.message);
+      },
+    });
+    if (out.ok) {
+      agentReplyText = extractN8nReply(out.data ?? out.text);
+    } else {
+      console.warn(out.status
+        ? `n8n Webhook a répondu HTTP ${out.status}, repli sur le moteur natif.`
+        : `n8n Webhook injoignable (${out.error}), repli sur le moteur natif.`);
     }
   }
 
-  // --- 4. SMART BUILT-IN CONVERSATIONAL ENGINE (Guaranteed 100% Reliable Fallback) ---
-  if (!agentReplyText) {
-    agentReplyText = generateSmartAgentReply(order, userResponsesCount, message);
+  // --- 2. Groq, then 3. any OpenAI-compatible endpoint ---
+  const contextBlock = `\n\nContexte :\nClient : ${order.client?.firstName ?? ''} ${order.client?.lastName ?? ''}\nForfait choisi : ${order.planName}\nÉchéance : ${order.deadline}\nQuestions posées : ${userResponsesCount}/4.\nSi ${userResponsesCount} >= 4, conclus chaleureusement et annonce la génération de l'audit de compatibilité.`;
+  const groqKey = typeof settings.groqApiKey === 'string' ? settings.groqApiKey.trim() : '';
+  if (!agentReplyText && (settings.provider === 'groq' || groqKey) && groqKey.length > 5) {
+    agentReplyText = await callChatCompletion({
+      endpoint: 'https://api.groq.com/openai/v1',
+      apiKey: groqKey,
+      model: asText(settings.groqModel, 120) || 'llama-3.3-70b-versatile',
+      systemPrompt: `${settings.systemPrompt}${contextBlock}`,
+      history,
+    });
   }
+  const openaiKey = typeof settings.apiKey === 'string' ? settings.apiKey.trim() : '';
+  if (!agentReplyText && openaiKey.length > 5) {
+    agentReplyText = await callChatCompletion({
+      endpoint: asText(settings.customEndpoint, 500) || 'https://api.openai.com/v1',
+      apiKey: openaiKey,
+      model: asText(settings.model, 120) || 'gpt-4o-mini',
+      systemPrompt: `${settings.systemPrompt}${contextBlock}`,
+      history,
+    });
+  }
+
+  // --- 4. Built-in conversational engine, so the brief never stalls without a key ---
+  if (!agentReplyText) agentReplyText = generateSmartAgentReply(order, userResponsesCount, message);
 
   const agentMsg = {
-    id: `msg-${Date.now()}-a`,
-    sender: "agent",
-    message: agentReplyText,
-    timestamp: new Date().toISOString()
+    id: `msg-${Date.now()}-${randomUUID().slice(0, 8)}-a`,
+    sender: 'agent',
+    message: String(agentReplyText).slice(0, 8000),
+    timestamp: new Date().toISOString(),
   };
-  order.chatHistory.push(agentMsg);
-  order.questionsAskedCount = (order.questionsAskedCount || 1) + 1;
+  const shouldFinalize = userResponsesCount >= 4;
 
-  // Auto-finalize brief if 4 questions reached
-  if (userResponsesCount >= 4 || shouldFinalize) {
-    order.isBriefComplete = true;
-    order.status = "Brief finalisé — En analyse";
-    order.compatibilityReport = generateCompatibilityAudit(order);
-  }
+  // The write happens after the slow provider call, inside the queue, on a freshly
+  // read copy: two clients briefing at the same time used to overwrite each other.
+  const updated = await withOrders(orders => {
+    const target = orders.find(o => o.id === req.params.id);
+    if (!target) return false;
+    if (!Array.isArray(target.chatHistory)) target.chatHistory = [];
+    target.chatHistory.push(userMsg, agentMsg);
+    target.questionsAskedCount = (target.questionsAskedCount || 1) + 1;
+    if (shouldFinalize && !target.isBriefComplete) {
+      target.isBriefComplete = true;
+      target.status = 'Brief finalisé — En analyse';
+      target.compatibilityReport = generateCompatibilityAudit(target);
+    }
+    return target;
+  });
+  if (!updated) return res.status(404).json({ success: false, error: 'Commande introuvable' });
 
-  orders[orderIndex] = order;
-  writeJson(ORDERS_FILE, orders);
+  sendSseEvent('order_updated', redactOrder(updated));
 
-  sendSseEvent('order_updated', order);
-
+  // The client keeps its own token from the response, so the order is returned as is;
+  // only the broadcast to other tabs is redacted.
   res.json({
     success: true,
-    order,
+    order: updated,
     agentReply: agentMsg,
-    isComplete: order.isBriefComplete,
-    compatibilityReport: order.compatibilityReport
+    isComplete: updated.isBriefComplete,
+    compatibilityReport: updated.compatibilityReport,
   });
-});
+}));
 
 // Helper for Smart Conversational Agent
 function generateSmartAgentReply(order, count, userText) {
   const isAgent = order.projectType === 'agent_ai';
-  const plan = order.planId;
 
   if (isAgent) {
     if (count === 1) {
@@ -689,7 +906,8 @@ function generateSmartAgentReply(order, count, userText) {
 
 // Helper to calculate realistic, intelligent compatibility audit
 function generateCompatibilityAudit(order) {
-  const fullText = order.chatHistory.filter(m => m.sender === 'user').map(m => m.message).join(' ').toLowerCase();
+  const history = Array.isArray(order.chatHistory) ? order.chatHistory : [];
+  const fullText = history.filter(m => m.sender === 'user').map(m => m.message ?? '').join(' ').toLowerCase();
   const plan = order.planId;
   const isAgent = order.projectType === 'agent_ai';
 
@@ -752,321 +970,366 @@ function generateCompatibilityAudit(order) {
 }
 
 // 5. POST /api/orders/:id/finalize - Manual or forced finalization
-app.post('/api/orders/:id/finalize', (req, res) => {
-  const orders = readJson(ORDERS_FILE, initialOrders);
-  const orderIndex = orders.findIndex(o => o.id === req.params.id);
-  if (orderIndex === -1) {
-    return res.status(404).json({ success: false, error: "Commande introuvable" });
-  }
+app.post('/api/orders/:id/finalize', route(async (req, res) => {
+  const updated = await withOrders(orders => {
+    const order = orders.find(o => o.id === req.params.id);
+    if (!order) return false;
+    order.isBriefComplete = true;
+    order.status = 'Brief finalisé — En analyse';
+    order.compatibilityReport = generateCompatibilityAudit(order);
+    return order;
+  });
+  if (!updated) return res.status(404).json({ success: false, error: 'Commande introuvable' });
 
-  const order = orders[orderIndex];
-  order.isBriefComplete = true;
-  order.status = "Brief finalisé — En analyse";
-  order.compatibilityReport = generateCompatibilityAudit(order);
-
-  orders[orderIndex] = order;
-  writeJson(ORDERS_FILE, orders);
-
-  sendSseEvent('order_updated', order);
-  res.json({ success: true, order });
-});
+  sendSseEvent('order_updated', redactOrder(updated));
+  res.json({ success: true, order: updated });
+}));
 
 // 6. PATCH /api/orders/:id - Update order status, notes, deliverable
-app.patch('/api/orders/:id', (req, res) => {
-  const orders = readJson(ORDERS_FILE, initialOrders);
-  const orderIndex = orders.findIndex(o => o.id === req.params.id);
-  if (orderIndex === -1) {
-    return res.status(404).json({ success: false, error: "Commande introuvable" });
-  }
-
-  const order = orders[orderIndex];
-  const { status, adminNotes, deliverable } = req.body;
+app.patch('/api/orders/:id', route(async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const { status, adminNotes } = body;
   if ((status !== undefined && (typeof status !== 'string' || status.length > 150)) || (adminNotes !== undefined && (typeof adminNotes !== 'string' || adminNotes.length > 20000))) {
-    return res.status(400).json({ success: false, error: 'Statut ou notes invalides.' });
+    return badRequest(res, 'Statut ou notes invalides.');
   }
-
-
-  if (status !== undefined) order.status = status;
-  if (adminNotes !== undefined) order.adminNotes = adminNotes;
-  if (deliverable !== undefined) {
-    order.deliverable = deliverable;
-    if (deliverable && deliverable.url) {
-      const registry = readJson(REGISTRY_FILE, initialRegistry);
-      const existingRegIdx = registry.findIndex(r => r.orderId === order.id);
-      const regEntry = {
-        id: existingRegIdx >= 0 ? registry[existingRegIdx].id : `REG-${randomUUID()}`,
-        orderId: order.id,
-        clientName: `${order.client.firstName} ${order.client.lastName}`,
-        projectName: deliverable.title || `${order.planName} - ${order.client.lastName}`,
-        planName: order.planName,
-        deliverableType: deliverable.type === 'agent_ai' ? 'Agent IA & Automatisation' : 'Site Web',
-        deliverableUrl: deliverable.url,
-        deliveredAt: new Date().toISOString(),
-        status: "Actif en production",
-        notes: deliverable.notes || "Livré et validé par l'équipe DigitalVerse."
-      };
-      if (existingRegIdx >= 0) {
-        registry[existingRegIdx] = regEntry;
-      } else {
-        registry.unshift(regEntry);
-      }
-      writeJson(REGISTRY_FILE, registry);
-      sendSseEvent('registry_updated', registry);
+  let deliverable = body.deliverable;
+  if (deliverable !== undefined && deliverable !== null && !isPlainObject(deliverable)) {
+    return badRequest(res, 'Livrable invalide.');
+  }
+  if (deliverable) {
+    deliverable = {
+      type: deliverable.type === 'agent_ai' ? 'agent_ai' : 'website',
+      url: asText(deliverable.url, 2000) ?? '',
+      title: asText(deliverable.title, 300) ?? '',
+      notes: asText(deliverable.notes, 4000) ?? '',
+    };
+    if (deliverable.url && !isHttpUrl(deliverable.url)) {
+      return badRequest(res, 'URL de livrable invalide : http(s) uniquement.');
     }
   }
 
-  orders[orderIndex] = order;
-  if (!writeJson(ORDERS_FILE, orders)) return res.status(500).json({ success: false, error: 'Enregistrement impossible.' });
-
-  sendSseEvent('order_updated', order);
-  res.json({ success: true, order });
-});
-
-// 7. GET & POST /api/registry - Ready deliverables registry
-app.get('/api/registry', (req, res) => {
-  const registry = readJson(REGISTRY_FILE, initialRegistry);
-  res.json({ success: true, count: registry.length, registry });
-});
-
-app.post('/api/registry', (req, res) => {
-  const { orderId, clientName, projectName, planName, deliverableType, deliverableUrl, notes } = req.body;
-  if (!deliverableUrl) {
-    return res.status(400).json({ success: false, error: "L'URL livrable est obligatoire" });
-  }
-
-  const registry = readJson(REGISTRY_FILE, initialRegistry);
-  const newEntry = {
-    id: `REG-${randomUUID()}`,
-    orderId: orderId || "DIRECT",
-    clientName: clientName || "Client Partenaire",
-    projectName: projectName || "Projet DigitalVerse",
-    planName: planName || "Sur mesure",
-    deliverableType: deliverableType || "Site Web",
-    deliverableUrl: deliverableUrl.trim(),
-    deliveredAt: new Date().toISOString(),
-    status: "Actif en production",
-    notes: notes || ""
+  const patchRegistry = async order => {
+    if (!deliverable?.url) return null;
+    let registry;
+    try {
+      const stored = readJson(REGISTRY_FILE, initialRegistry);
+      registry = Array.isArray(stored) ? stored : [];
+    } catch (err) {
+      console.warn('Registry unreadable, skipping the automatic entry:', err.message);
+      return null;
+    }
+    const existingIdx = registry.findIndex(r => r.orderId === order.id);
+    const regEntry = {
+      id: existingIdx >= 0 ? registry[existingIdx].id : `REG-${randomUUID()}`,
+      orderId: order.id,
+      clientName: `${order.client?.firstName ?? ''} ${order.client?.lastName ?? ''}`.trim(),
+      projectName: deliverable.title || `${order.planName} - ${order.client?.lastName ?? ''}`.trim(),
+      planName: order.planName,
+      deliverableType: deliverable.type === 'agent_ai' ? 'Agent IA & Automatisation' : 'Site Web',
+      deliverableUrl: deliverable.url,
+      deliveredAt: new Date().toISOString(),
+      status: 'Actif en production',
+      notes: deliverable.notes || "Livré et validé par l'équipe DigitalVerse.",
+    };
+    if (existingIdx >= 0) registry[existingIdx] = regEntry;
+    else registry.unshift(regEntry);
+    // The registry entry is best-effort: if it cannot be written, the order itself is
+    // still saved and the admin is told, instead of a 500 on already-applied changes.
+    if (!writeJson(REGISTRY_FILE, registry)) return 'registry';
+    return registry;
   };
 
-  registry.unshift(newEntry);
-  writeJson(REGISTRY_FILE, registry);
+  let updated;
+  try {
+    updated = await withOrders(orders => {
+      const order = orders.find(o => o.id === req.params.id);
+      if (!order) return false;
+      if (status !== undefined) order.status = status;
+      if (adminNotes !== undefined) order.adminNotes = adminNotes;
+      if (deliverable !== undefined) order.deliverable = deliverable;
+      return order;
+    });
+  } catch (err) {
+    if (err instanceof StorageError) throw err;
+    return res.status(500).json({ success: false, error: 'Enregistrement impossible.' });
+  }
+  if (!updated) return res.status(404).json({ success: false, error: 'Commande introuvable' });
 
+  const registry = await patchRegistry(updated);
+  const failedRegistry = registry === 'registry';
+  if (Array.isArray(registry)) sendSseEvent('registry_updated', registry);
+  sendSseEvent('order_updated', redactOrder(updated));
+  res.json({
+    success: true,
+    order: updated,
+    ...(failedRegistry ? { warning: 'Commande enregistrée, mais le registre des livrables na pas pu être mis à jour.' } : {}),
+  });
+}));
+
+// 7. GET & POST /api/registry - Ready deliverables registry
+const readRegistry = () => {
+  const stored = readJson(REGISTRY_FILE, initialRegistry);
+  return Array.isArray(stored) ? stored : [];
+};
+let registryQueue = Promise.resolve();
+async function withRegistry(mutator) {
+  const run = async () => {
+    const registry = readRegistry();
+    const result = await mutator(registry);
+    if (result === false) return false;
+    if (!writeJson(REGISTRY_FILE, registry)) {
+      throw Object.assign(new Error('Enregistrement du registre impossible.'), { statusCode: 500 });
+    }
+    return Array.isArray(result) ? result : registry;
+  };
+  const next = registryQueue.then(run, run);
+  registryQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+app.get('/api/registry', route((req, res) => {
+  const registry = readRegistry();
+  res.json({ success: true, count: registry.length, registry });
+}));
+
+// `deliverableUrl` reaches an <a href> in the admin UI, so the scheme is checked here
+// rather than trusting the caller: a stored javascript: link is a click away from
+// running in the admin's session.
+const REGISTRY_FIELDS = { orderId: 120, clientName: 240, projectName: 300, planName: 240, deliverableType: 120, deliverableUrl: 2000, notes: 4000 };
+app.post('/api/registry', route(async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const invalidKey = Object.keys(REGISTRY_FIELDS).find(key => body[key] !== undefined && typeof body[key] !== 'string');
+  const url = asText(body.deliverableUrl, REGISTRY_FIELDS.deliverableUrl);
+  if (invalidKey) return badRequest(res, `Champ ${invalidKey} invalide.`);
+  if (!url || !isHttpUrl(url)) return badRequest(res, "URL livrable obligatoire (http ou https).");
+
+  const newEntry = {
+    id: `REG-${randomUUID()}`,
+    deliveredAt: new Date().toISOString(),
+    status: 'Actif en production',
+    deliverableUrl: url,
+  };
+  for (const [key, max] of Object.entries(REGISTRY_FIELDS)) {
+    if (key === 'deliverableUrl') continue;
+    newEntry[key] = asText(body[key], max) || ({ orderId: 'DIRECT', clientName: 'Client Partenaire', projectName: 'Projet DigitalVerse', planName: 'Sur mesure', deliverableType: 'Site Web', notes: '' }[key] ?? '');
+  }
+
+  const registry = await withRegistry(list => {
+    list.unshift(newEntry);
+    return list;
+  });
   sendSseEvent('registry_updated', registry);
   res.status(201).json({ success: true, entry: newEntry });
-});
+}));
 
 // 8. GET & POST /api/settings - AI API Configuration
-app.get('/api/settings', (req, res) => {
+const maskKey = value => (typeof value === 'string' && value
+  ? (value.length > 8 ? `${value.slice(0, 4)}...${value.slice(-4)}` : '••••••••')
+  : '');
+const PROVIDERS = ['n8n', 'groq', 'openai', 'anthropic', 'custom'];
+
+app.get('/api/settings', route((req, res) => {
   const settings = readJson(SETTINGS_FILE, defaultSettings);
-  
-  const maskedKey = settings.apiKey
-    ? settings.apiKey.length > 8
-      ? `${settings.apiKey.slice(0, 4)}...${settings.apiKey.slice(-4)}`
-      : '••••••••'
-    : '';
-
-  const maskedGroqKey = settings.groqApiKey
-    ? settings.groqApiKey.length > 8
-      ? `${settings.groqApiKey.slice(0, 4)}...${settings.groqApiKey.slice(-4)}`
-      : '••••••••'
-    : '';
-
+  const n8nUrl = asText(settings.n8nWebhookUrl, 500) ?? '';
   res.json({
     success: true,
     settings: {
-      provider: settings.provider,
-      n8nWebhookUrl: settings.n8nWebhookUrl || '',
-      n8nWebhookId: settings.n8nWebhookId || 'b639adfd-6c4b-48cd-af68-fb21384fcc52',
-      n8nMode: settings.n8nMode || 'webhook',
-      hasN8n: Boolean(settings.n8nWebhookUrl && settings.n8nWebhookUrl.trim().length > 0),
-      
-      hasGroqKey: Boolean(settings.groqApiKey && settings.groqApiKey.trim().length > 0),
-      maskedGroqKey,
-      groqModel: settings.groqModel || 'llama-3.3-70b-versatile',
+      provider: PROVIDERS.includes(settings.provider) ? settings.provider : defaultSettings.provider,
+      n8nWebhookUrl: n8nUrl,
+      n8nWebhookId: asText(settings.n8nWebhookId, 200) ?? '',
+      n8nMode: settings.n8nMode === 'webhook-test' ? 'webhook-test' : 'webhook',
+      hasN8n: n8nUrl.length > 0,
 
-      hasKey: Boolean(settings.apiKey && settings.apiKey.trim().length > 0),
-      maskedKey,
-      model: settings.model,
-      customEndpoint: settings.customEndpoint,
-      systemPrompt: settings.systemPrompt
-    }
+      hasGroqKey: Boolean(asText(settings.groqApiKey, 400)),
+      maskedGroqKey: maskKey(settings.groqApiKey),
+      groqModel: asText(settings.groqModel, 120) ?? '',
+
+      hasKey: Boolean(asText(settings.apiKey, 400)),
+      maskedKey: maskKey(settings.apiKey),
+      model: asText(settings.model, 120) ?? '',
+      customEndpoint: asText(settings.customEndpoint, 500) ?? '',
+      systemPrompt: asText(settings.systemPrompt, 8000) ?? '',
+    },
   });
-});
+}));
 
-app.post('/api/settings', (req, res) => {
-  const {
-    provider,
-    n8nWebhookUrl,
-    n8nWebhookId,
-    n8nMode,
-    groqApiKey,
-    groqModel,
-    apiKey,
-    model,
-    customEndpoint,
-    systemPrompt
-  } = req.body;
+// Field -> max length. Anything not listed here is refused, so the settings payload
+// can no longer smuggle arbitrary keys into the data file.
+const SETTINGS_LIMITS = {
+  provider: 20,
+  n8nWebhookUrl: 500,
+  n8nWebhookId: 200,
+  n8nMode: 20,
+  groqApiKey: 400,
+  groqModel: 120,
+  apiKey: 400,
+  model: 120,
+  customEndpoint: 500,
+  systemPrompt: 8000,
+};
+app.post('/api/settings', route((req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const unknown = Object.keys(body).filter(key => !(key in SETTINGS_LIMITS));
+  const wrongType = Object.keys(body).filter(key => key in SETTINGS_LIMITS && body[key] !== null && typeof body[key] !== 'string');
+  if (unknown.length || wrongType.length) {
+    return badRequest(res, `Paramètres non reconnus ou de type inattendu : ${[...unknown, ...wrongType].slice(0, 4).join(', ')}.`);
+  }
+  if (body.provider !== undefined && !PROVIDERS.includes(body.provider)) {
+    return badRequest(res, `Fournisseur inconnu. Valeurs acceptées : ${PROVIDERS.join(', ')}.`);
+  }
+  if (body.n8nWebhookUrl) {
+    const probe = /^https?:\/\//i.test(body.n8nWebhookUrl.trim()) ? body.n8nWebhookUrl.trim() : `https://${body.n8nWebhookUrl.trim()}`;
+    if (!resolveOutboundUrl(probe)) return badRequest(res, 'URL n8n invalide (http/https, hôte public).');
+  }
+  if (body.customEndpoint && !resolveOutboundUrl(body.customEndpoint.trim())) {
+    return badRequest(res, 'Endpoint invalide (http/https, hôte public).');
+  }
 
-  const settings = readJson(SETTINGS_FILE, defaultSettings);
+  const settings = { ...readJson(SETTINGS_FILE, defaultSettings) };
+  for (const [key, max] of Object.entries(SETTINGS_LIMITS)) {
+    if (body[key] === undefined) continue;
+    // An empty string now really clears a stored key; it used to be ignored, which
+    // made it impossible to remove a key once saved.
+    settings[key] = key.endsWith('ApiKey') || key === 'apiKey'
+      ? (body[key] === '' ? '' : body[key].trim())
+      : asText(body[key], max) ?? '';
+  }
+  if (body.n8nMode !== undefined) settings.n8nMode = body.n8nMode === 'webhook-test' ? 'webhook-test' : 'webhook';
 
-  if (provider !== undefined) settings.provider = provider;
-  if (n8nWebhookUrl !== undefined) settings.n8nWebhookUrl = n8nWebhookUrl.trim();
-  if (n8nWebhookId !== undefined) settings.n8nWebhookId = n8nWebhookId.trim();
-  if (n8nMode !== undefined) settings.n8nMode = n8nMode;
-  if (groqApiKey !== undefined && groqApiKey !== '') settings.groqApiKey = groqApiKey.trim();
-  if (groqModel !== undefined) settings.groqModel = groqModel;
-  if (apiKey !== undefined && apiKey !== '') settings.apiKey = apiKey.trim();
-  if (model !== undefined) settings.model = model;
-  if (customEndpoint !== undefined) settings.customEndpoint = customEndpoint;
-  if (systemPrompt !== undefined) settings.systemPrompt = systemPrompt;
-
-  writeJson(SETTINGS_FILE, settings);
+  if (!writeJson(SETTINGS_FILE, settings)) {
+    return res.status(500).json({ success: false, error: 'Enregistrement des paramètres impossible.' });
+  }
   res.json({ success: true, message: "Paramètres de l'Agent IA & n8n enregistrés avec succès." });
-});
+}));
 
 // 9. GET /api/settings/n8n-workflow - Get current n8n workflow file
-app.get('/api/settings/n8n-workflow', (req, res) => {
+app.get('/api/settings/n8n-workflow', route((req, res) => {
   const workflow = readJson(N8N_WORKFLOW_FILE, {});
   res.json({ success: true, workflow });
-});
+}));
 
 // 10. POST /api/settings/test-n8n - Test n8n Webhook connectivity
-app.post('/api/settings/test-n8n', async (req, res) => {
-  const { n8nWebhookUrl, n8nWebhookId, n8nMode } = req.body;
+app.post('/api/settings/test-n8n', route(async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
   const settings = readJson(SETTINGS_FILE, defaultSettings);
-
-  let targetUrl = (n8nWebhookUrl || settings.n8nWebhookUrl || '').trim();
-  const hookId = (n8nWebhookId || settings.n8nWebhookId || 'b639adfd-6c4b-48cd-af68-fb21384fcc52').trim();
-  const mode = n8nMode || settings.n8nMode || 'webhook';
-
+  const candidate = {
+    n8nWebhookUrl: asText(body.n8nWebhookUrl, 500) || asText(settings.n8nWebhookUrl, 500) || '',
+    n8nWebhookId: asText(body.n8nWebhookId, 200) || asText(settings.n8nWebhookId, 200) || '',
+    n8nMode: (asText(body.n8nMode, 20) || asText(settings.n8nMode, 20) || 'webhook') === 'webhook-test' ? 'webhook-test' : 'webhook',
+  };
+  if (!candidate.n8nWebhookUrl) {
+    return badRequest(res, "Veuillez renseigner l'URL de votre instance n8n (ex: https://n8n.votre-domaine.com).");
+  }
+  const targetUrl = buildN8nTarget(candidate);
   if (!targetUrl) {
+    return badRequest(res, "URL n8n invalide : hôte http/https public (autorisez les hôtes privés avec ALLOW_PRIVATE_WEBHOOKS=1).");
+  }
+
+  const startTime = Date.now();
+  const out = await requestJson(targetUrl, {
+    body: {
+      action: 'sendMessage',
+      chatInput: 'Ping test de connectivité DigitalVerse. Réponds en un mot : "Connecté"',
+      sessionId: 'test-ping-01',
+    },
+  });
+  const elapsed = Date.now() - startTime;
+
+  if (!out.ok) {
+    if (out.status === 0) {
+      return res.status(400).json({ success: false, error: `Impossible de contacter l'instance n8n : ${out.error}` });
+    }
     return res.status(400).json({
       success: false,
-      error: "Veuillez renseigner l'URL de votre instance n8n (ex: https://n8n.votre-domaine.com)."
+      error: `n8n a répondu avec le statut HTTP ${out.status}. Vérifiez que le workflow est activé dans n8n.`,
     });
   }
-
-  if (!targetUrl.includes('/webhook')) {
-    targetUrl = `${targetUrl.replace(/\/+$/, '')}/${mode}/${hookId}/chat`;
-  }
-
-  try {
-    const startTime = Date.now();
-    const testResp = await fetch(targetUrl, {
-      method: 'POST',
-      signal: AbortSignal.timeout(30000),
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'sendMessage',
-        chatInput: 'Ping test de connectivité DigitalVerse. Réponds en un mot : "Connecté"',
-        sessionId: 'test-ping-01'
-      })
-    });
-    const elapsed = Date.now() - startTime;
-
-    if (testResp.ok) {
-      let textReply = "OK";
-      try {
-        const d = await testResp.json();
-        textReply = d.output || d.text || JSON.stringify(d);
-      } catch (e) {
-        textReply = await testResp.text();
-      }
-      return res.json({
-        success: true,
-        message: `Webhook n8n joint avec succès en ${elapsed}ms ! Réponse de l'Agent : "${textReply.slice(0, 150)}"`
-      });
-    } else {
-      return res.status(400).json({
-        success: false,
-        error: `n8n a répondu avec le statut HTTP ${testResp.status}. Vérifiez que le workflow est activé dans n8n.`
-      });
-    }
-  } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: `Impossible de contacter l'instance n8n : ${err.message}`
-    });
-  }
-});
+  const reply = (extractN8nReply(out.data ?? out.text) || 'OK').slice(0, 150);
+  res.json({ success: true, message: `Webhook n8n joint avec succès en ${elapsed}ms ! Réponse de l'Agent : "${reply}"` });
+}));
 
 // 11. POST /api/settings/test - Test API Key connectivity (OpenAI / Groq)
-app.post('/api/settings/test', async (req, res) => {
-  const { apiKey, model, customEndpoint, provider } = req.body;
+app.post('/api/settings/test', route(async (req, res) => {
+  const body = isPlainObject(req.body) ? req.body : {};
   const settings = readJson(SETTINGS_FILE, defaultSettings);
-
-  const isGroq = provider === 'groq';
-  const targetKey = isGroq
-    ? (apiKey || settings.groqApiKey || '').trim()
-    : (apiKey || settings.apiKey || '').trim();
+  const isGroq = body.provider === 'groq';
+  const targetKey = (asText(body.apiKey, 400) || (isGroq ? asText(settings.groqApiKey, 400) : asText(settings.apiKey, 400)) || '').trim();
 
   if (!targetKey) {
-    return res.status(400).json({
-      success: false,
-      error: "Aucune clé API fournie. Le moteur de fallback heuristique DigitalVerse reste actif."
-    });
+    return badRequest(res, "Aucune clé API fournie. Le moteur de fallback heuristique DigitalVerse reste actif.");
   }
 
   const endpoint = isGroq
     ? 'https://api.groq.com/openai/v1'
-    : (customEndpoint || settings.customEndpoint || 'https://api.openai.com/v1');
+    : (asText(body.customEndpoint, 500) || asText(settings.customEndpoint, 500) || 'https://api.openai.com/v1');
+  const testUrl = resolveOutboundUrl(endpoint.replace(/\/+$/, ''), 'chat/completions');
+  if (!testUrl) return badRequest(res, 'Endpoint invalide : hôte http/https public attendu.');
+  const chosenModel = asText(body.model, 120) || (isGroq ? asText(settings.groqModel, 120) : asText(settings.model, 120)) || (isGroq ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini');
 
-  const chosenModel = isGroq
-    ? (model || settings.groqModel || 'llama-3.3-70b-versatile')
-    : (model || settings.model || 'gpt-4o-mini');
+  const startTime = Date.now();
+  const out = await requestJson(testUrl, {
+    headers: { Authorization: `Bearer ${targetKey}` },
+    body: {
+      model: chosenModel,
+      messages: [{ role: 'user', content: 'Ping test. Réponds en un mot : "Connecté"' }],
+      max_tokens: 10,
+    },
+  });
+  const elapsed = Date.now() - startTime;
 
-  try {
-    const startTime = Date.now();
-    const testResp = await fetch(`${endpoint}/chat/completions`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(30000),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${targetKey}`
-      },
-      body: JSON.stringify({
-        model: chosenModel,
-        messages: [{ role: 'user', content: 'Ping test. Réponds en un mot : "Connecté"' }],
-        max_tokens: 10
-      })
-    });
-
-    const elapsed = Date.now() - startTime;
-
-    if (testResp.ok) {
-      const data = await testResp.json();
-      const reply = data.choices?.[0]?.message?.content || "OK";
-      return res.json({
-        success: true,
-        message: `API ${isGroq ? 'Groq' : 'LLM'} opérationnelle en ${elapsed}ms ! Réponse du modèle : "${reply.trim()}"`
-      });
-    } else {
-      const errText = await testResp.text();
-      return res.status(400).json({
-        success: false,
-        error: `Erreur fournisseur (${testResp.status}) : ${errText.slice(0, 150)}`
-      });
-    }
-  } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: `Impossible de contacter le serveur distant : ${err.message}`
-    });
+  if (!out.ok) {
+    if (out.status === 0) return res.status(400).json({ success: false, error: `Impossible de contacter le serveur distant : ${out.error}` });
+    return res.status(400).json({ success: false, error: `Erreur fournisseur (${out.status}) : ${out.text.slice(0, 150)}` });
   }
-});
+  const reply = out.data?.choices?.[0]?.message?.content?.trim() || 'OK';
+  res.json({ success: true, message: `API ${isGroq ? 'Groq' : 'LLM'} opérationnelle en ${elapsed}ms ! Réponse du modèle : "${reply}"` });
+}));
+
+// Unknown API route -> JSON 404, never the SPA shell.
+app.use('/api', (req, res) => res.status(404).json({ success: false, error: 'Route API introuvable' }));
 
 // Serve Vite static files if dist exists
 const DIST_DIR = path.join(__dirname, 'dist');
 if (fs.existsSync(DIST_DIR)) {
-  app.use(express.static(DIST_DIR));
-  app.get('*', (req, res) => {
-    if (req.path.startsWith('/api')) {
-      return res.status(404).json({ success: false, error: "Route API introuvable" });
-    }
-    res.sendFile(path.join(DIST_DIR, 'index.html'));
-  });
+  app.use(express.static(DIST_DIR, { maxAge: '1h', index: false }));
+  app.get('*', (req, res, next) => res.sendFile(path.join(DIST_DIR, 'index.html'), err => (err ? next(err) : undefined)));
 }
+
+// Single error funnel. Before this, any unexpected throw (a non-string field reaching
+// `.trim()`, a corrupt data file) was answered by Express' default HTML page leaking
+// stack frames and absolute paths, and a throw inside the async chat handler escaped
+// as an unhandled rejection.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  const status = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
+  if (status >= 500) console.error(`[${req.method} ${req.originalUrl}]`, err?.stack || err);
+  if (res.headersSent) return next(err);
+  // A StorageError is an operator-facing diagnosis (unreadable data file), so it is
+  // safe to show; anything else stays generic so a crash cannot leak paths or frames.
+  const explain = status < 500 || err instanceof StorageError;
+  res.status(status).json({
+    success: false,
+    error: explain ? (err?.message || 'Requête invalide.') : 'Erreur interne du serveur. Les données n’ont pas été modifiées.',
+    ...(explain || status < 500 ? {} : { hint: 'Consultez les journaux du serveur.' }),
+  });
+});
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`DigitalVerse Agency Server running on http://0.0.0.0:${server.address().port}`);
 });
+
+// Finish the writes that are already queued before dying, so a restart during a burst
+// of orders cannot leave a half-written file behind.
+let shuttingDown = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} reçu : arrêt du serveur.`);
+    for (const client of sseClients) {
+      try { client.res.end(); } catch { /* already gone */ }
+    }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}

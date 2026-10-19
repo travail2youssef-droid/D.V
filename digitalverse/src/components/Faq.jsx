@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { FAQ_ITEMS } from '../data/content';
-import { ChevronDown, HelpCircle, MessageSquare } from 'lucide-react';
+import { ChevronDown, MessageSquare } from 'lucide-react';
 
 export default function Faq({ onOpenContact }) {
   const [openIndex, setOpenIndex] = useState(0); // Open first question by default

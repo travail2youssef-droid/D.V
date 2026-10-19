@@ -1,14 +1,17 @@
-import React, { useState, useEffect, useRef } from 'react';
-import {
-  Shield, Lock, RefreshCw, Search, Filter, ExternalLink, CheckCircle2,
-  AlertCircle, Bot, Globe, Clock, User, Phone, Mail, Calendar, ArrowRight,
-  Sliders, Settings, Plus, Copy, Check, Save, Sparkles, X, ChevronRight,
-  Volume2, VolumeX, Cpu, Network, FileCode, Play
-} from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Shield, RefreshCw, Search, ExternalLink, CheckCircle2, AlertCircle, Bot, Globe, Clock, Phone, Mail, Plus, Copy, Check, Save, Sparkles, X, ChevronRight, Volume2, VolumeX, Cpu, Network, Play } from 'lucide-react';
+
+// Same defensive rule as AdminWorkspace: only http(s) may become a clickable link, so
+// a stale or hand-edited data file cannot put a javascript: URL in front of an admin.
+const safeUrl = value => {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol) ? value : null;
+  } catch {
+    return null;
+  }
+};
 
 export default function AdminDashboard({ isOpen, onClose }) {
-  if (!isOpen) return null;
-
   // Tabs: 'orders' | 'registry' | 'settings' | 'workflow'
   const [activeTab, setActiveTab] = useState('orders');
 
@@ -71,6 +74,10 @@ export default function AdminDashboard({ isOpen, onClose }) {
   // Copy indicator state
   const [copiedId, setCopiedId] = useState(null);
 
+  // Connection state of the admin panel itself, surfaced in the header.
+  const [liveConnected, setLiveConnected] = useState(true);
+  const [loadError, setLoadError] = useState('');
+
   // Deliverable edit form for an order
   const [deliverableForm, setDeliverableForm] = useState({
     url: '',
@@ -96,15 +103,28 @@ export default function AdminDashboard({ isOpen, onClose }) {
       gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
       osc.start();
       osc.stop(ctx.currentTime + 0.35);
-    } catch (e) {}
+    } catch (e) {
+      // Autoplay policy can reject the AudioContext; a missing chime is not an error.
+    }
+  };
+
+  // Every admin read goes through this: a 401 (session expired) or a 503 (admin not
+  // configured) used to fail silently, leaving a dashboard that looked alive but was
+  // frozen — and every write from it was then rejected without explanation.
+  const fetchJson = async (url, options) => {
+    const res = await fetch(url, options);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) {
+      throw new Error(data.error || `Le serveur a répondu ${res.status}.`);
+    }
+    return data;
   };
 
   // Fetch Orders
   const fetchOrders = async (silent = false) => {
     if (!silent) setLoadingOrders(true);
     try {
-      const res = await fetch('/api/orders');
-      const data = await res.json();
+      const data = await fetchJson('/api/orders');
       if (data.success && data.orders) {
         if (prevOrdersCountRef.current > 0 && data.orders.length > prevOrdersCountRef.current) {
           playChime();
@@ -118,7 +138,7 @@ export default function AdminDashboard({ isOpen, onClose }) {
         }
       }
     } catch (err) {
-      console.error("Erreur chargement commandes:", err);
+      setLoadError(err.message);
     } finally {
       if (!silent) setLoadingOrders(false);
       setLastRefreshed(new Date());
@@ -130,13 +150,10 @@ export default function AdminDashboard({ isOpen, onClose }) {
   const fetchRegistry = async () => {
     setLoadingRegistry(true);
     try {
-      const res = await fetch('/api/registry');
-      const data = await res.json();
-      if (data.success) {
-        setRegistry(data.registry);
-      }
+      const data = await fetchJson('/api/registry');
+      setRegistry(Array.isArray(data.registry) ? data.registry : []);
     } catch (err) {
-      console.error("Erreur chargement registre:", err);
+      setLoadError(err.message);
     } finally {
       setLoadingRegistry(false);
     }
@@ -145,32 +162,39 @@ export default function AdminDashboard({ isOpen, onClose }) {
   // Fetch Settings
   const fetchSettings = async () => {
     try {
-      const res = await fetch('/api/settings');
-      const data = await res.json();
-      if (data.success) {
-        setSettings(data.settings);
-        setN8nUrlInput(data.settings.n8nWebhookUrl || '');
-        setN8nModeInput(data.settings.n8nMode || 'webhook');
-      }
+      const data = await fetchJson('/api/settings');
+      setSettings(data.settings);
+      setN8nUrlInput(data.settings.n8nWebhookUrl || '');
+      setN8nModeInput(data.settings.n8nMode || 'webhook');
     } catch (err) {
-      console.error("Erreur chargement paramètres:", err);
+      setLoadError(err.message);
     }
   };
 
+  // The interval and the EventSource must call the *current* closures without being
+  // rebuilt on each render, hence the refs.
+  const tickRef = useRef(fetchOrders);
+  tickRef.current = fetchOrders;
+  const chimeRef = useRef(playChime);
+  chimeRef.current = playChime;
+
+  // Mount-only: the fetchers are redefined on every render, so listing them as
+  // dependencies would refetch on each keystroke in the filters.
   useEffect(() => {
     fetchOrders();
     fetchRegistry();
     fetchSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-refresh timer
   useEffect(() => {
-    if (autoRefreshInterval === 0) return;
+    if (autoRefreshInterval === 0) return undefined;
 
     const timer = setInterval(() => {
       setRefreshCountdown((prev) => {
         if (prev <= 1) {
-          fetchOrders(true);
+          tickRef.current(true);
           return autoRefreshInterval;
         }
         return prev - 1;
@@ -178,33 +202,48 @@ export default function AdminDashboard({ isOpen, onClose }) {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [autoRefreshInterval, selectedOrder]);
+  }, [autoRefreshInterval]);
 
   // SSE for live instant notifications
   useEffect(() => {
     let eventSource;
+    let disposed = false;
+    const read = data => { try { return JSON.parse(data); } catch { return null; } };
+
     try {
       eventSource = new EventSource('/api/events');
+      eventSource.addEventListener('open', () => setLiveConnected(true));
       eventSource.addEventListener('new_order', (e) => {
-        const newOrder = JSON.parse(e.data);
-        playChime();
+        const newOrder = read(e.data);
+        if (!newOrder?.id) return;
+        chimeRef.current();
         setOrders(prev => [newOrder, ...prev.filter(o => o.id !== newOrder.id)]);
       });
       eventSource.addEventListener('order_updated', (e) => {
-        const updated = JSON.parse(e.data);
-        setOrders(prev => prev.map(o => o.id === updated.id ? updated : o));
-        setSelectedOrder(prev => prev && prev.id === updated.id ? updated : prev);
+        const updated = read(e.data);
+        if (!updated?.id) return;
+        setOrders(prev => prev.map(o => (o.id === updated.id ? updated : o)));
+        setSelectedOrder(prev => (prev && prev.id === updated.id ? updated : prev));
       });
       eventSource.addEventListener('registry_updated', (e) => {
-        const updatedReg = JSON.parse(e.data);
-        setRegistry(updatedReg);
+        const updatedReg = read(e.data);
+        if (Array.isArray(updatedReg)) setRegistry(updatedReg);
       });
-    } catch (e) {}
+      // A closed stream retries forever by default: an expired session turned this
+      // into a silent request loop. Surface it and let the manual refresh take over.
+      eventSource.onerror = () => {
+        if (disposed) return;
+        if (eventSource.readyState === EventSource.CLOSED) setLiveConnected(false);
+      };
+    } catch (err) {
+      setLiveConnected(false);
+    }
 
     return () => {
+      disposed = true;
       if (eventSource) eventSource.close();
     };
-  }, [soundEnabled]);
+  }, []);
 
   const handleOpenOrder = (order) => {
     setSelectedOrder(order);
@@ -422,9 +461,9 @@ export default function AdminDashboard({ isOpen, onClose }) {
                 <h2 className="text-base sm:text-lg font-extrabold text-white tracking-tight">
                   Espace Administrateur DigitalVerse
                 </h2>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>En direct</span>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 ${liveConnected ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/15 text-amber-400 border border-amber-500/30'}`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${liveConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+                  <span>{liveConnected ? 'En direct' : 'Temps réel perdu — rafraîchissement manuel'}</span>
                 </span>
               </div>
               <div className="text-xs text-neutral-400 flex items-center gap-2 mt-0.5">
@@ -528,6 +567,9 @@ export default function AdminDashboard({ isOpen, onClose }) {
           </div>
 
           <div className="hidden lg:flex items-center gap-4 text-xs text-neutral-400">
+            {loadError && (
+              <span className="text-[#F20D25] font-semibold" role="alert">Synchro KO : {loadError}</span>
+            )}
             <span>Dernière synchro : {lastRefreshed.toLocaleTimeString()}</span>
           </div>
         </div>
@@ -686,8 +728,9 @@ export default function AdminDashboard({ isOpen, onClose }) {
                 <h3 className="text-sm font-bold text-white">
                   Registre des livrables finalisés & Actifs en production
                 </h3>
-                <p className="text-xs text-neutral-400">
-                  Conservez l'inventaire des sites déployés, des widgets d'agents IA et des accès clients.
+                <p className="text-xs text-neutral-400 flex items-center gap-2">
+                  {loadingRegistry && <RefreshCw className="w-3 h-3 animate-spin" aria-hidden="true" />}
+                  {loadingRegistry ? 'Chargement du registre…' : 'Conservez l\'inventaire des sites déployés, des widgets d\'agents IA et des accès clients.'}
                 </p>
               </div>
 
@@ -726,9 +769,10 @@ export default function AdminDashboard({ isOpen, onClose }) {
                     <div className="text-xs text-neutral-400 flex items-center gap-2">
                       <span>URL / Accès :</span>
                       <a
-                        href={entry.deliverableUrl}
-                        target="_blank"
+                        href={safeUrl(entry.deliverableUrl) || '#'}
+                        target={safeUrl(entry.deliverableUrl) ? '_blank' : undefined}
                         rel="noreferrer"
+                        aria-disabled={!safeUrl(entry.deliverableUrl)}
                         className="text-[#FF2E44] hover:underline font-mono text-[11px] flex items-center gap-1"
                       >
                         <span>{entry.deliverableUrl}</span>

@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import confetti from 'canvas-confetti';
-import { Bot, Send, User, CheckCircle2, AlertTriangle, ArrowRight, Sparkles, Clock, RefreshCw, X, ShieldCheck } from 'lucide-react';
+import { Bot, Send, User, CheckCircle2, Sparkles, X, ShieldCheck } from 'lucide-react';
 
 export default function AiChatBrief({ order, onClose, onOpenAdmin }) {
   const [currentOrder, setCurrentOrder] = useState(order);
@@ -9,6 +9,7 @@ export default function AiChatBrief({ order, onClose, onOpenAdmin }) {
   const [isTyping, setIsTyping] = useState(false);
   const [isFinalized, setIsFinalized] = useState(order?.isBriefComplete || false);
   const [report, setReport] = useState(order?.compatibilityReport || null);
+  const [error, setError] = useState('');
   const messagesEndRef = useRef(null);
 
   // Auto-scroll to bottom of messages
@@ -31,10 +32,33 @@ export default function AiChatBrief({ order, onClose, onOpenAdmin }) {
     }
   }, [isFinalized, report]);
 
+  // The API is authoritative for the thread: a rejected request must not leave a
+  // message that looks sent. Until now every failure was only console.error'ed.
+  const sendBrief = async (path, payload) => {
+    const res = await fetch(`/api/orders/${currentOrder.id}/${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Order-Token': currentOrder.clientToken || '',
+      },
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || `Le serveur a répondu ${res.status}.`);
+    }
+    return data;
+  };
+
   const handleSendMessage = async (customText = null) => {
     const textToSend = (customText || inputVal).trim();
     if (!textToSend || isTyping) return;
+    if (!currentOrder?.clientToken) {
+      setError('Cette session de cadrage a expiré. Rechargez la page et relancez la demande depuis la grille tarifaire.');
+      return;
+    }
 
+    setError('');
     setInputVal('');
 
     // Immediately append user message to UI
@@ -48,47 +72,39 @@ export default function AiChatBrief({ order, onClose, onOpenAdmin }) {
     setIsTyping(true);
 
     try {
-      const res = await fetch(`/api/orders/${currentOrder.id}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Order-Token': currentOrder.clientToken || '' },
-        body: JSON.stringify({ message: textToSend })
-      });
-
-      const data = await res.json();
-      setIsTyping(false);
-
-      if (data.success && data.order) {
-        setCurrentOrder(data.order);
-        setMessages(data.order.chatHistory);
-        if (data.isComplete) {
-          setIsFinalized(true);
-          setReport(data.compatibilityReport);
-        }
+      const data = await sendBrief('chat', { message: textToSend });
+      setCurrentOrder(data.order);
+      setMessages(data.order.chatHistory);
+      if (data.isComplete) {
+        setIsFinalized(true);
+        setReport(data.compatibilityReport);
       }
     } catch (err) {
+      setMessages(prev => prev.filter(m => m.id !== tempUserMsg.id));
+      setInputVal(textToSend);
+      setError(err.message);
+    } finally {
       setIsTyping(false);
-      console.error("Erreur chat:", err);
     }
   };
 
   const handleManualFinalize = async () => {
+    if (!currentOrder?.clientToken) {
+      setError('Cette session de cadrage a expiré. Rechargez la page et relancez la demande depuis la grille tarifaire.');
+      return;
+    }
     setIsTyping(true);
+    setError('');
     try {
-      const res = await fetch(`/api/orders/${currentOrder.id}/finalize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Order-Token': currentOrder.clientToken || '' }
-      });
-      const data = await res.json();
-      setIsTyping(false);
-      if (data.success && data.order) {
-        setCurrentOrder(data.order);
-        setMessages(data.order.chatHistory);
-        setIsFinalized(true);
-        setReport(data.order.compatibilityReport);
-      }
+      const data = await sendBrief('finalize');
+      setCurrentOrder(data.order);
+      setMessages(data.order.chatHistory);
+      setIsFinalized(true);
+      setReport(data.order.compatibilityReport);
     } catch (err) {
+      setError(err.message);
+    } finally {
       setIsTyping(false);
-      console.error("Erreur finalisation:", err);
     }
   };
 
@@ -333,6 +349,11 @@ export default function AiChatBrief({ order, onClose, onOpenAdmin }) {
 
         {/* Bottom Input Area */}
         <div className="p-4 border-t border-white/10 bg-[#121212] flex-shrink-0">
+          {error && (
+            <p role="alert" className="mb-3 px-3 py-2 rounded-xl bg-red-950/40 border border-[#F20D25]/50 text-[11px] text-[#FF8591]">
+              {error}
+            </p>
+          )}
           {isFinalized ? (
             <div className="text-center py-2 flex flex-col sm:flex-row items-center justify-center gap-3 text-xs text-neutral-400">
               <span>Le cadrage technique pour cette commande est validé et archivé.</span>

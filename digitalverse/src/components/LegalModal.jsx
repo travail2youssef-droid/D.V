@@ -1,4 +1,3 @@
-import React from 'react';
 import { X, Shield } from 'lucide-react';
 
 export default function LegalModal({ isOpen, type, onClose }) {
