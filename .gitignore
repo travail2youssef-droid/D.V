@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+# Client submissions
+digitalverse/data/contacts.json
+digitalverse/data/*.tmp

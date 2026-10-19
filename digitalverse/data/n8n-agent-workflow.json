@@ -1,0 +1,90 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.5,
+      "position": [0, 0],
+      "id": "8a5ca088-ffb2-451c-9d5c-a6184c82cdd0",
+      "name": "When chat message received",
+      "webhookId": "b639adfd-6c4b-48cd-af68-fb21384fcc52"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [192, -64],
+      "id": "dfc57bd8-5b2f-4015-9cd0-85d1a026f787",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-20b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [96, 208],
+      "id": "db7ace6b-6d1f-494d-8553-d2f684f373f6",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "jhotIeKg0xUXFgyY",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [240, 208],
+      "id": "30ee166c-5ec9-435f-8b94-eea5672fc301",
+      "name": "Simple Memory"
+    }
+  ],
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "373814b73e6e3e5a6ded090ef27494dc4208003bde5d729b2c8cac19f72dc9fc"
+  }
+}

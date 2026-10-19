@@ -1,0 +1,26 @@
+[
+  {
+    "id": "REG-01",
+    "orderId": "DV-9102",
+    "clientName": "Alexandre de Montmirail",
+    "projectName": "Maison Vélora — Haute Maroquinerie",
+    "planName": "Business Fonctionnel (600 €)",
+    "deliverableType": "Site Web",
+    "deliverableUrl": "https://maison-velora.digitalverse.app",
+    "deliveredAt": "2026-10-18T12:30:33.169Z",
+    "status": "Actif en production",
+    "notes": "Site déployé avec SSL, DNS OVH configuré et temps de chargement 0.6s."
+  },
+  {
+    "id": "REG-02",
+    "orderId": "DV-7721",
+    "clientName": "Sophie Martin",
+    "projectName": "Pulse — Assistant IA Conseiller",
+    "planName": "Chatbot IA Entreprise (40 €/mois)",
+    "deliverableType": "Agent IA & Widget",
+    "deliverableUrl": "https://agent.digitalverse.app/pulse-advisor",
+    "deliveredAt": "2026-10-16T12:30:33.169Z",
+    "status": "Actif en production",
+    "notes": "Script widget JS intégré dans le header client. 1400 conversations traitées."
+  }
+]
