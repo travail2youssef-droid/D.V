@@ -1,4 +1,3 @@
-import React from 'react';
 import { PRINCIPLES } from '../data/content';
 import { Sparkles, Target, Smartphone, Shield } from 'lucide-react';
 

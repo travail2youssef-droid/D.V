@@ -1,4 +1,3 @@
-import React from 'react';
 import { SERVICES } from '../data/content';
 import { Code, Brain, Zap, ShieldCheck, ArrowRight, Check } from 'lucide-react';
 

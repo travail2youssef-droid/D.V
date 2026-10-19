@@ -1,13 +1,20 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import http from 'node:http';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-let server, directory, origin;
+let server, directory, origin, fakeN8n, n8nPort;
 before(async () => {
   directory = await mkdtemp(path.join(tmpdir(), 'digitalverse-'));
-  server = spawn(process.execPath, ['server.js'], { env: { ...process.env, PORT: '0', DATA_DIR: directory, ADMIN_USER: 'tester', ADMIN_PASSWORD: 'test-only-password' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  // A deliberately slow agent endpoint: it holds the request open long enough that a
+  // read-modify-write race on orders.json becomes reproducible instead of theoretical.
+  fakeN8n = http.createServer((req, res) => {
+    setTimeout(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ output: 'pong' })); }, 150);
+  }).listen(0, '127.0.0.1');
+  await new Promise(resolve => fakeN8n.once('listening', () => { n8nPort = fakeN8n.address().port; resolve(); }));
+  server = spawn(process.execPath, ['server.js'], { env: { ...process.env, PORT: '0', DATA_DIR: directory, ADMIN_USER: 'tester', ADMIN_PASSWORD: 'test-only-password', ALLOW_PRIVATE_WEBHOOKS: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
   // Read the assigned port from the startup log, without hardcoding a test port.
   origin = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Server startup timed out')), 10000);
@@ -19,6 +26,7 @@ before(async () => {
   });
 });
 after(async () => {
+  if (fakeN8n) fakeN8n.close();
   if (server && server.exitCode === null) await new Promise(resolve => { server.once('exit', resolve); server.kill(); });
   if (directory) await rm(directory, { recursive: true, force: true });
 });
@@ -76,4 +84,106 @@ test('admin login creates a revocable HttpOnly session', async () => {
   assert.equal((await (await fetch(`${origin}/api/auth/session`, { headers: { cookie } })).json()).authenticated, true);
   assert.equal((await fetch(`${origin}/api/auth/logout`, { method: 'POST', headers: { cookie } })).status, 200);
   assert.equal((await fetch(`${origin}/api/orders`, { headers: { cookie } })).status, 401);
+});
+
+// --- Régressions couvertes après audit du 19/10 ---
+
+const admin = (url, options = {}) => fetch(`${origin}${url}`, {
+  ...options,
+  headers: { ...options.headers, Authorization: `Basic ${Buffer.from('tester:test-only-password').toString('base64')}` },
+});
+
+test('les types inattendus renvoient 400 en JSON, sans fuite de stack', async () => {
+  const responses = await Promise.all([
+    admin('/api/registry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deliverableUrl: 123 }) }),
+    admin('/api/registry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deliverableUrl: 'javascript:alert(1)' }) }),
+    admin('/api/orders/x', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deliverable: 'non' }) }),
+  ]);
+  for (const response of responses) {
+    const text = await response.text();
+    assert.equal(response.status, 400, text.slice(0, 120));
+    assert.match(response.headers.get('content-type'), /application\/json/);
+    assert.ok(!text.includes('<!DOCTYPE') && !text.includes('server.js:'), `fuite de stack: ${text.slice(0, 120)}`);
+  }
+});
+
+test('les réglages refusent les clés inconnues et permettent de retirer une clé API', async () => {
+  const junk = await admin('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: 'sk-test', evil: 'x' }) });
+  assert.equal(junk.status, 400);
+
+  const save = await admin('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: 'sk-test-1234567890' }) });
+  assert.equal(save.status, 200);
+  assert.equal((await (await admin('/api/settings')).json()).settings.hasKey, true);
+
+  await admin('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: '' }) });
+  assert.equal((await (await admin('/api/settings')).json()).settings.hasKey, false, 'une chaîne vide doit effacer la clé');
+});
+
+test('un fichier de données corrompu est signalé, jamais écrasé par les valeurs par défaut', async () => {
+  const file = path.join(directory, 'orders.json');
+  const backup = await readFile(file, 'utf8');
+  await writeFile(file, '{ json tronqué');
+
+  const response = await admin('/api/orders');
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /illisibles/);
+  assert.equal(await readFile(file, 'utf8'), '{ json tronqué', 'les données doivent rester en place pour réparation');
+
+  await writeFile(file, backup);
+});
+
+test('deux messages simultanés sur un même brief ne s’écrasent pas', async () => {
+  // Point the brief at the slow fake provider, so both requests are mid-flight at once.
+  const configured = await admin('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'n8n', n8nWebhookUrl: `http://127.0.0.1:${n8nPort}`, n8nWebhookId: 'test-hook' }),
+  });
+  assert.equal(configured.status, 200);
+
+  const created = await fetch(`${origin}/api/orders`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client: { firstName: 'Deux', lastName: 'Clients', email: 'deux@example.com' } }),
+  });
+  const { order } = await created.json();
+  const headers = { 'Content-Type': 'application/json', 'X-Order-Token': order.clientToken };
+  const messages = ['Premier besoin', 'Second besoin', 'Troisième besoin'];
+
+  const replies = await Promise.all(messages.map(message =>
+    fetch(`${origin}/api/orders/${order.id}/chat`, { method: 'POST', headers, body: JSON.stringify({ message }) }).then(r => r.json())
+  ));
+  assert.ok(replies.every(r => r.success), 'le fournisseur lent doit répondre');
+
+  const stored = await (await admin(`/api/orders/${order.id}`)).json();
+  const history = stored.order.chatHistory;
+  const userMessages = history.filter(m => m.sender === 'user').map(m => m.message);
+  const agentMessages = history.filter(m => m.sender === 'agent').map(m => m.message);
+  for (const message of messages) {
+    assert.ok(userMessages.includes(message), `message perdu par la course d’écriture: ${JSON.stringify(userMessages)}`);
+  }
+  assert.equal(agentMessages.filter(m => m === 'pong').length, 3, 'chaque réponse du provider doit être conservée');
+
+  await admin('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'n8n', n8nWebhookUrl: '' }),
+  });
+});
+
+test('les commandes ne fuient pas le jeton de brief vers l’administration, et la 404 API est en JSON', async () => {
+  const list = await (await admin('/api/orders')).json();
+  assert.ok(list.orders.length > 0);
+  assert.ok(list.orders.every(o => o.clientToken === undefined), 'clientToken ne doit pas être diffusé aux onglets admin');
+
+  const missing = await fetch(`${origin}/api/inexistant`);
+  assert.equal(missing.status, 404);
+  assert.match((await missing.json()).error, /introuvable/);
+});
+
+test('l’authentification Basic est limitée en débit, y compris sur les routes admin', async () => {
+  let last;
+  for (let i = 0; i < 12; i++) {
+    last = await fetch(`${origin}/api/orders`, { headers: { Authorization: `Basic ${Buffer.from('tester:mauvais-mot-de-passe').toString('base64')}` } });
+    if (last.status === 429) break;
+  }
+  assert.equal(last.status, 429, 'le brute-force sur Basic doit être bloqué');
+  assert.ok((await last.json()).error.includes('15 minutes'));
 });

@@ -3,6 +3,10 @@ dist/
 .env
 .env.*
 !.env.example
-# Client submissions
+# Client submissions, orders (PII) and AI settings (API keys): all runtime data,
+# never to be committed. The server seeds them on first boot.
 digitalverse/data/contacts.json
+digitalverse/data/orders.json
+digitalverse/data/registry.json
+digitalverse/data/settings.json
 digitalverse/data/*.tmp

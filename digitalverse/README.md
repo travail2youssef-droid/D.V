@@ -133,25 +133,32 @@ La scène d’accueil est une géométrie CSS 3D, sans moteur WebGL ni modèle �
 
 `POST /api/contact` valide les données et le consentement, limite les demandes (5 par adresse réseau sur 10 minutes), puis enregistre les contacts dans `data/contacts.json` avant de confirmer la réception. **Aucun email n’est envoyé** : il faut encore intégrer un prestataire email si nécessaire. Les demandes sont consultables en JSON via `/api/contacts`, protégé comme l’administration.
 
+Le CORS est désactivé par défaut (aucune en-tête émise) : le site appelle l’API à la même origine. Renseignez `CORS_ORIGIN` uniquement si un autre domaine doit appeler l’API. Derrière un reverse proxy TLS, mettez `TRUST_PROXY_HOPS=1`, sinon tous les visiteurs partagent le même compteur de limitation de débit.
+
 L’administration est fermée par défaut. Configurer `ADMIN_USER` et `ADMIN_PASSWORD` dans l’environnement du serveur puis redémarrer. Ne pas les placer dans des variables `VITE_*` ni les versionner. `/admin` affiche désormais une page de connexion dédiée. La connexion crée une session serveur de 8 heures avec cookie HttpOnly et SameSite=Strict ; la déconnexion révoque la session. Les sessions sont perdues au redémarrage du serveur. HTTP Basic reste accepté pour les clients API existants. Utiliser impérativement HTTPS en production. Les routes de lecture des commandes, modification administrative, configuration IA, registre, contacts et événements SSE sont protégées. Le fichier `.env.example` n’est pas chargé automatiquement.
 
 ### Vérifications
 
 ```bash
+npm run lint
 npm run build
 npm test
 ```
+
+`npm test` construit le site d'abord (`pretest`), parce qu'il vérifie que les six URLs publiques répondent avec le vrai `index.html` servi par Express.
 
 Les tests serveur utilisent un dossier temporaire isolé et vérifient validation, persistance, limitation de débit, refus d’accès administratif et chargement direct des six URLs publiques. Ils ne remplacent pas une vérification visuelle dans un navigateur.
 
 ### Limites restantes avant production
 
-- Les commandes restent stockées en JSON : migration transactionnelle SQLite/PostgreSQL encore nécessaire pour éviter les écrasements concurrents pendant les appels IA.
+- Les commandes restent stockées en JSON. Les écritures sont désormais atomiques (`tmp` + `rename`, mode `0600`) et sérialisées dans le processus, donc plus de perte de messages pendant un appel IA lent ; un déploiement multi-processus ou multi-instance exige quand même SQLite/PostgreSQL, la file étant locale à chaque instance.
+- Les données de runtime sont hors de Git (`data/orders.json`, `registry.json`, `settings.json`, `contacts.json`) : les clés API et le PII client ne peuvent plus être commis par erreur. Un `git rm --cached` ayant été nécessaire, vérifiez l'historique si ces fichiers ont déjà été poussés et révoquez les clés concernées.
 - L’administration possède une connexion par session et une déconnexion. Elle utilise un seul compte configuré par environnement : comptes multiples, rôles, récupération de mot de passe et MFA restent à développer. Les sessions en mémoire nécessiteraient un stockage partagé en déploiement multi-instance.
 - Les nouvelles commandes possèdent un UUID et un jeton client privé requis pour le chat et la finalisation. Les anciennes commandes sans jeton ne peuvent plus utiliser ces routes ; elles restent consultables par l’administration. Une reprise sécurisée par email reste à développer.
-- Valider strictement les endpoints IA/webhook et bloquer les réseaux privés pour durcir la protection SSRF.
+- Les URLs de webhook et d'endpoint IA sont validées (http/https, hôte public) avant tout appel sortant ; `ALLOW_PRIVATE_WEBHOOKS=1` autorise un n8n en réseau interne. Il reste une ouverture : un nom de domaine public qui résout vers une IP privée n'est pas détecté, ce qui demande un verrouillage réseau ou une résolution contrôlée.
+- Le throttling (contact, connexion, création de commande, Basic auth) est en mémoire et par processus : derrière plusieurs instances, chaque instance a son propre compteur.
 - L’audit est une préqualification heuristique, pas une garantie de faisabilité.
-- Les données historiques de démonstration déjà présentes dans le dépôt doivent être remplacées par un stockage privé avant utilisation réelle.
+- Les données de démonstration ne sont plus écrites au démarrage en `NODE_ENV=production` (à forcer malgré tout : `DV_SEED_DEMO=1`).
 
 
 ## Administration repensée et logo officiel

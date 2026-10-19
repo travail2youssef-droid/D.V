@@ -1,11 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { PRICING_PLANS } from '../data/content';
-import { X, ArrowRight, CheckCircle2, Globe, Bot, Calendar, User, Mail, Phone, Sparkles, AlertCircle } from 'lucide-react';
+import { X, ArrowRight, Globe, Bot, User, Mail, Phone, Sparkles, AlertCircle } from 'lucide-react';
 
 export default function OrderModal({ isOpen, onClose, initialPlan, onOrderCreated }) {
-  if (!isOpen) return null;
+  // Form State — hooks must run on every render, so the closed state is handled at the
+  // end of the component instead of an early return before them.
 
-  // Form State
   const [projectType, setProjectType] = useState('site'); // 'site' | 'agent_ai'
   const [selectedPlanId, setSelectedPlanId] = useState('business-fonctionnel');
   const [deadline, setDeadline] = useState('2 à 3 semaines');
@@ -21,7 +21,7 @@ export default function OrderModal({ isOpen, onClose, initialPlan, onOrderCreate
   // Sync initial plan if passed
   useEffect(() => {
     if (initialPlan) {
-      if (initialPlan.category === 'ai' || initialPlan.id.startsWith('agent')) {
+      if (initialPlan.category === 'ai' || initialPlan.category === 'agent_ai' || String(initialPlan.id ?? '').startsWith('agent')) {
         setProjectType('agent_ai');
       } else {
         setProjectType('site');
@@ -44,6 +44,7 @@ export default function OrderModal({ isOpen, onClose, initialPlan, onOrderCreate
   }, [projectType, availablePlans, selectedPlanId]);
 
   const activePlan = availablePlans.find(p => p.id === selectedPlanId) || availablePlans[0];
+
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -85,19 +86,21 @@ export default function OrderModal({ isOpen, onClose, initialPlan, onOrderCreate
         body: JSON.stringify(payload)
       });
 
-      const data = await res.json();
-      setLoading(false);
-
-      if (data.success && data.order) {
-        onOrderCreated(data.order);
-      } else {
-        setError(data.error || "Une erreur est survenue lors de l'enregistrement.");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.order) {
+        setError(data.error || `Le serveur a répondu ${res.status}. Réessayez ou écrivez-nous directement.`);
+        return;
       }
+
+      onOrderCreated(data.order);
     } catch (err) {
+      setError("Impossible de contacter le serveur. Vérifiez votre connexion puis réessayez.");
+    } finally {
       setLoading(false);
-      setError("Impossible de contacter le serveur. Veuillez réessayer.");
     }
   };
+
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md animate-fadeIn overflow-y-auto">
@@ -196,10 +199,12 @@ export default function OrderModal({ isOpen, onClose, initialPlan, onOrderCreate
               {availablePlans.map((plan) => {
                 const isSelected = selectedPlanId === plan.id;
                 return (
-                  <div
+                  <button
+                    type="button"
                     key={plan.id}
+                    aria-pressed={isSelected}
                     onClick={() => setSelectedPlanId(plan.id)}
-                    className={`p-3.5 rounded-2xl border cursor-pointer transition-all flex items-start justify-between ${
+                    className={`text-left p-3.5 rounded-2xl border transition-all flex items-start justify-between ${
                       isSelected
                         ? 'bg-[#161616] border-[#F20D25] ring-1 ring-[#F20D25]'
                         : 'bg-[#101010] border-white/10 hover:border-white/20'
@@ -223,7 +228,7 @@ export default function OrderModal({ isOpen, onClose, initialPlan, onOrderCreate
                       <div className="text-sm font-extrabold text-[#F20D25]">{plan.price}</div>
                       <div className="text-[10px] text-neutral-400">{plan.billing}</div>
                     </div>
-                  </div>
+                  </button>
                 );
               })}
             </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import Logo from './Logo';
 import { Menu, X, ArrowRight, ShieldCheck } from 'lucide-react';
 

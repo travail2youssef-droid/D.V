@@ -1,6 +1,4 @@
-import React from 'react';
-import { AGENCY_INFO } from '../data/content';
-import { Shield, Sparkles, Cpu, Layers } from 'lucide-react';
+import { Shield, Cpu, Layers } from 'lucide-react';
 
 export default function About() {
   return (

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { PRICING_PLANS } from '../data/content';
 import { Check, ArrowRight, Sparkles, HelpCircle } from 'lucide-react';
 
