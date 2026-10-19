@@ -68,7 +68,20 @@ test('briefing requires the private token returned at order creation', async () 
   assert.ok(order.clientToken);
   const url = `${origin}/api/orders/${order.id}/finalize`;
   assert.equal((await fetch(url, { method: 'POST' })).status, 403);
-  assert.equal((await fetch(url, { method: 'POST', headers: { 'X-Order-Token': order.clientToken } })).status, 200);
+  const finalizedResponse = await fetch(url, { method: 'POST', headers: { 'X-Order-Token': order.clientToken } });
+  assert.equal(finalizedResponse.status, 200);
+  const finalized = await finalizedResponse.json();
+  const repeatedFinalize = await fetch(url, { method: 'POST', headers: { 'X-Order-Token': order.clientToken } });
+  const repeated = await repeatedFinalize.json();
+  assert.equal(repeatedFinalize.status, 200);
+  assert.equal(repeated.order.compatibilityReport.completedAt, finalized.order.compatibilityReport.completedAt, 'la finalisation est idempotente');
+
+  const afterFinalize = await fetch(`${origin}/api/orders/${order.id}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Order-Token': order.clientToken },
+    body: JSON.stringify({ message: 'Un message après la clôture' }),
+  });
+  assert.equal(afterFinalize.status, 409, 'un brief clos ne doit plus grossir ni déclencher de réponse');
 });
 
 test('admin login creates a revocable HttpOnly session', async () => {
@@ -117,6 +130,16 @@ test('les réglages refusent les clés inconnues et permettent de retirer une cl
 
   await admin('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: '' }) });
   assert.equal((await (await admin('/api/settings')).json()).settings.hasKey, false, 'une chaîne vide doit effacer la clé');
+
+  const inactiveEndpoints = await admin('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'anthropic', n8nWebhookUrl: 'endpoint-inactif', customEndpoint: 'endpoint-inactif' }),
+  });
+  assert.equal(inactiveEndpoints.status, 200, 'des endpoints inactifs ne doivent pas empêcher d’enregistrer le fournisseur sélectionné');
+  await admin('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'n8n', n8nWebhookUrl: '', customEndpoint: 'https://api.openai.com/v1' }),
+  });
 });
 
 test('un fichier de données corrompu est signalé, jamais écrasé par les valeurs par défaut', async () => {
@@ -161,6 +184,25 @@ test('deux messages simultanés sur un même brief ne s’écrasent pas', async 
     assert.ok(userMessages.includes(message), `message perdu par la course d’écriture: ${JSON.stringify(userMessages)}`);
   }
   assert.equal(agentMessages.filter(m => m === 'pong').length, 3, 'chaque réponse du provider doit être conservée');
+
+  const floodCreate = await fetch(`${origin}/api/orders`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client: { firstName: 'Flux', lastName: 'Concurrent', email: 'flux@example.com' } }),
+  });
+  const { order: floodOrder } = await floodCreate.json();
+  const floodHeaders = { 'Content-Type': 'application/json', 'X-Order-Token': floodOrder.clientToken };
+  const floodResponses = await Promise.all(Array.from({ length: 9 }, (_, index) =>
+    fetch(`${origin}/api/orders/${floodOrder.id}/chat`, {
+      method: 'POST', headers: floodHeaders, body: JSON.stringify({ message: `Réponse ${index + 1}` }),
+    }).then(async response => ({ status: response.status, body: await response.json(), retryAfter: response.headers.get('retry-after') }))
+  ));
+  assert.equal(floodResponses.filter(response => response.status === 200).length, 8);
+  const limited = floodResponses.find(response => response.status === 429);
+  assert.ok(limited, 'la neuvième requête doit être limitée par commande');
+  assert.ok(Number(limited.retryAfter) > 0, 'le client doit recevoir Retry-After');
+  const floodStored = await (await admin(`/api/orders/${floodOrder.id}`)).json();
+  assert.equal(floodStored.order.chatHistory.filter(message => message.sender === 'user').length, 8);
+  assert.equal(floodStored.order.isBriefComplete, true, 'les requêtes concurrentes doivent finaliser le brief au seuil réel');
 
   await admin('/api/settings', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

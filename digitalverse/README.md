@@ -92,7 +92,7 @@ Accessible à tout moment via le bouton **"Espace Admin"** dans le menu ou le pi
    - Saisie et consultation de l'URL du site final ou du lien d'intégration de l'agent IA.
    - Outils de copie rapide du lien en un clic et ouverture directe du livrable.
 3. **Configuration & Test de l'API IA** :
-   - Sélection du fournisseur (OpenAI, Anthropic / Claude, ou Endpoint personnalisé Groq/Ollama/OpenRouter).
+   - Sélection du fournisseur (OpenAI-compatible, Anthropic / Claude via l’API Messages, Groq direct, n8n ou endpoint compatible OpenAI personnalisé).
    - Champ sécurisé pour renseigner la clé d'API.
    - Sélection du modèle (ex : `gpt-4o-mini`, `gpt-4o`, etc.) et du endpoint de base.
    - Personnalisation du Prompt Système de l'agent.
@@ -114,6 +114,8 @@ Le serveur écoute sur le port `3000` (`http://0.0.0.0:3000`).
 
 ### Installation et lancement
 
+Pré-requis : Node.js `^20.19.0` ou `>=22.12.0`.
+
 ```bash
 npm ci
 npm run build
@@ -131,7 +133,7 @@ La scène d’accueil est une géométrie CSS 3D, sans moteur WebGL ni modèle �
 
 ### Contact réel et administration
 
-`POST /api/contact` valide les données et le consentement, limite les demandes (5 par adresse réseau sur 10 minutes), puis enregistre les contacts dans `data/contacts.json` avant de confirmer la réception. **Aucun email n’est envoyé** : il faut encore intégrer un prestataire email si nécessaire. Les demandes sont consultables en JSON via `/api/contacts`, protégé comme l’administration.
+`POST /api/contact` valide les données et le consentement, limite les demandes (5 par adresse réseau sur 10 minutes), puis enregistre les contacts dans `data/contacts.json` avant de confirmer la réception. La création de commandes est limitée à 10 par IP sur 10 minutes ; le chat est limité à 30 messages par IP et 8 par commande sur 10 minutes, et refuse tout nouveau message après finalisation. **Aucun email n’est envoyé** : il faut encore intégrer un prestataire email si nécessaire. Les demandes sont consultables en JSON via `/api/contacts`, protégé comme l’administration.
 
 Le CORS est désactivé par défaut (aucune en-tête émise) : le site appelle l’API à la même origine. Renseignez `CORS_ORIGIN` uniquement si un autre domaine doit appeler l’API. Derrière un reverse proxy TLS, mettez `TRUST_PROXY_HOPS=1`, sinon tous les visiteurs partagent le même compteur de limitation de débit.
 
@@ -155,8 +157,8 @@ Les tests serveur utilisent un dossier temporaire isolé et vérifient validatio
 - Les données de runtime sont hors de Git (`data/orders.json`, `registry.json`, `settings.json`, `contacts.json`) : les clés API et le PII client ne peuvent plus être commis par erreur. Un `git rm --cached` ayant été nécessaire, vérifiez l'historique si ces fichiers ont déjà été poussés et révoquez les clés concernées.
 - L’administration possède une connexion par session et une déconnexion. Elle utilise un seul compte configuré par environnement : comptes multiples, rôles, récupération de mot de passe et MFA restent à développer. Les sessions en mémoire nécessiteraient un stockage partagé en déploiement multi-instance.
 - Les nouvelles commandes possèdent un UUID et un jeton client privé requis pour le chat et la finalisation. Les anciennes commandes sans jeton ne peuvent plus utiliser ces routes ; elles restent consultables par l’administration. Une reprise sécurisée par email reste à développer.
-- Les URLs de webhook et d'endpoint IA sont validées (http/https, hôte public) avant tout appel sortant ; `ALLOW_PRIVATE_WEBHOOKS=1` autorise un n8n en réseau interne. Il reste une ouverture : un nom de domaine public qui résout vers une IP privée n'est pas détecté, ce qui demande un verrouillage réseau ou une résolution contrôlée.
-- Le throttling (contact, connexion, création de commande, Basic auth) est en mémoire et par processus : derrière plusieurs instances, chaque instance a son propre compteur.
+- Les URLs de webhook et d'endpoint IA sont validées en HTTP(S), résolues avant connexion et épinglées sur l'adresse IP contrôlée ; les plages privées/réservées et les redirections sont refusées par défaut. `ALLOW_PRIVATE_WEBHOOKS=1` désactive volontairement ce blocage pour un n8n auto-hébergé en réseau interne : ne l’activer que dans un environnement de confiance.
+- Le throttling (contact, connexion, Basic auth, commandes et chat) est borné mais reste en mémoire et par processus : derrière plusieurs instances, chaque instance a son propre compteur ; utiliser un store partagé (Redis, par exemple) pour le déploiement distribué.
 - L’audit est une préqualification heuristique, pas une garantie de faisabilité.
 - Les données de démonstration ne sont plus écrites au démarrage en `NODE_ENV=production` (à forcer malgré tout : `DV_SEED_DEMO=1`).
 
